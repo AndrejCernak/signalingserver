@@ -1,20 +1,22 @@
 // server.js
-import { WebSocketServer } from 'ws';
-import { createServer } from 'http';
-import { v4 as uuid } from 'uuid';
+import { WebSocketServer } from "ws";
+import { createServer } from "http";
+import { v4 as uuid } from "uuid";
 
 const server = createServer((req, res) => {
   res.writeHead(200);
-  res.end('WebRTC signaling server ✅');
+  res.end("WebRTC signaling server ✅");
 });
 
 const wss = new WebSocketServer({ server });
 
-const rooms = new Map();   // roomId -> Set<ws>
-const meta = new Map();    // ws -> { id, roomId }
+const rooms = new Map(); // roomId -> Set<ws>
+const meta = new Map(); // ws -> { id, roomId, username }
 
 function send(ws, type, payload = {}) {
-  if (ws.readyState === ws.OPEN) ws.send(JSON.stringify({ type, ...payload }));
+  if (ws.readyState === ws.OPEN) {
+    ws.send(JSON.stringify({ type, ...payload }));
+  }
 }
 
 function broadcastToRoom(roomId, exceptWs, type, payload = {}) {
@@ -36,70 +38,83 @@ function leaveRoom(ws) {
   if (peers) {
     peers.delete(ws);
     if (peers.size === 0) rooms.delete(roomId);
-    else broadcastToRoom(roomId, ws, 'peer-left', { peerId: id });
+    else broadcastToRoom(roomId, ws, "peer-left", { peerId: id });
   }
   info.roomId = null;
 }
 
-wss.on('connection', (ws) => {
+wss.on("connection", (ws) => {
   const id = uuid();
-  meta.set(ws, { id, roomId: null });
-  console.log('🔌 Client connected:', id);
+  meta.set(ws, { id, roomId: null, username: null });
+  console.log("🔌 Client connected:", id);
 
-  ws.on('message', (msg) => {
+  ws.on("message", (msg) => {
     let data;
-    try { data = JSON.parse(msg.toString()); } catch { return; }
+    try {
+      data = JSON.parse(msg.toString());
+    } catch {
+      return;
+    }
 
     const { type } = data;
 
-    if (type === 'join') {
-      const { roomId } = data;
+    if (type === "join") {
+      const { roomId, username } = data;
       meta.get(ws).roomId = roomId;
+      meta.get(ws).username = username || null; // uložíme username
       if (!rooms.has(roomId)) rooms.set(roomId, new Set());
       rooms.get(roomId).add(ws);
-      console.log(`👥 ${id} joined room ${roomId}`);
-      // už NERINGUJEME na peer-joined, ale môžeme informovať UI
-      broadcastToRoom(roomId, ws, 'peer-joined', { peerId: id });
+      console.log(`👥 ${id} joined room ${roomId} as ${username || "unknown"}`);
+
+      broadcastToRoom(roomId, ws, "peer-joined", {
+        peerId: id,
+        username: username || null,
+      });
       return;
     }
 
-    const roomId = meta.get(ws).roomId;
+    const info = meta.get(ws);
+    const roomId = info.roomId;
+    const username = info.username;
     if (!roomId || !rooms.has(roomId)) return;
 
-    // VOLANIE – riadi zvonenie/accept/hangup (nie SDP!)
-    if (type === 'call') {
-      // zavolaj druhému peerovi v roomke
-      broadcastToRoom(roomId, ws, 'incoming-call', { from: id, roomId });
+    // VOLANIE
+    if (type === "call") {
+      broadcastToRoom(roomId, ws, "incoming-call", {
+        from: id,
+        username: username || "Client", // ➡️ pošleme username
+        roomId,
+      });
       return;
     }
-    if (type === 'accept') {
-      broadcastToRoom(roomId, ws, 'call-accepted', { from: id });
+    if (type === "accept") {
+      broadcastToRoom(roomId, ws, "call-accepted", { from: id });
       return;
     }
-    if (type === 'reject') {
-      broadcastToRoom(roomId, ws, 'call-rejected', { from: id });
+    if (type === "reject") {
+      broadcastToRoom(roomId, ws, "call-rejected", { from: id });
       return;
     }
-    if (type === 'hangup') {
-      broadcastToRoom(roomId, ws, 'call-ended', { from: id });
+    if (type === "hangup") {
+      broadcastToRoom(roomId, ws, "call-ended", { from: id });
       return;
     }
 
-    // SDP/ICE po akceptovaní
-    if (type === 'offer' || type === 'answer' || type === 'candidate') {
+    // SDP/ICE
+    if (["offer", "answer", "candidate"].includes(type)) {
       broadcastToRoom(roomId, ws, type, { from: id, ...data });
       return;
     }
 
-    if (type === 'leave') {
+    if (type === "leave") {
       leaveRoom(ws);
     }
   });
 
-  ws.on('close', () => {
+  ws.on("close", () => {
     leaveRoom(ws);
     meta.delete(ws);
-    console.log('❌ Client disconnected:', id);
+    console.log("❌ Client disconnected:", id);
   });
 });
 
