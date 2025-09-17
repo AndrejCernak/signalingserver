@@ -80,17 +80,24 @@ wss.on("connection", (ws) => {
 
     // VOLANIE
     if (type === "call") {
-      broadcastToRoom(roomId, ws, "incoming-call", {
-        from: id,
-        username: username || "Client", // ➡️ pošleme username
-        roomId,
-      });
-      return;
-    }
-    if (type === "accept") {
-      broadcastToRoom(roomId, ws, "call-accepted", { from: id });
-      return;
-    }
+  const { callId } = data;
+  broadcastToRoom(roomId, ws, "incoming-call", {
+    from: id,
+    roomId,
+    callId,                  // ✅ pošli callId ďalej
+    username: username || "Client",
+  });
+  return;
+}
+if (type === "accept") {
+  const { callId } = data;
+  broadcastToRoom(roomId, ws, "call-accepted", {
+    from: id,
+    callId,                  // ✅ vráť callId späť
+  });
+  return;
+}
+
     if (type === "reject") {
       broadcastToRoom(roomId, ws, "call-rejected", { from: id });
       return;
