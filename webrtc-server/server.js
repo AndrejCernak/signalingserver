@@ -104,6 +104,7 @@ wss.on("connection", (ws) => {
       const { callId } = data;
       broadcastToRoom(roomId, ws, "incoming-call", {
         from: username,
+        callerName: callerName || username,
         roomId,
         callId,
       });
