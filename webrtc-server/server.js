@@ -101,15 +101,16 @@ wss.on("connection", (ws) => {
 
     // VOLANIE
     if (type === "call") {
-      const { callId } = data;
-      broadcastToRoom(roomId, ws, "incoming-call", {
-        from: username,
-        callerName: callerName || username,
-        roomId,
-        callId,
-      });
-      return;
-    }
+  const { callId, callerName } = data; // 👈 vytiahni aj callerName
+  broadcastToRoom(roomId, ws, "incoming-call", {
+    from: username,
+    callerName: callerName || username, // 👈 teraz je definované
+    roomId,
+    callId,
+  });
+  return;
+}
+
 
     if (type === "accept") {
       const { callId } = data;
