@@ -1,4 +1,3 @@
-// server.js
 import { WebSocketServer } from "ws";
 import { createServer } from "http";
 import { v4 as uuid } from "uuid";
@@ -11,7 +10,8 @@ const server = createServer((req, res) => {
 const wss = new WebSocketServer({ server });
 
 const rooms = new Map(); // roomId -> Set<ws>
-const meta = new Map(); // ws -> { id, roomId, username }
+const meta = new Map();  // ws -> { id, roomId, username }
+const users = new Map(); // username -> ws (aktuálny socket)
 
 function send(ws, type, payload = {}) {
   if (ws.readyState === ws.OPEN) {
@@ -32,19 +32,28 @@ function broadcastToRoom(roomId, exceptWs, type, payload = {}) {
 function leaveRoom(ws) {
   const info = meta.get(ws);
   if (!info) return;
-  const { roomId, id } = info;
+  const { roomId, username } = info;
   if (!roomId) return;
+
   const peers = rooms.get(roomId);
   if (peers) {
     peers.delete(ws);
-    if (peers.size === 0) rooms.delete(roomId);
-    else broadcastToRoom(roomId, ws, "peer-left", { peerId: id });
+    if (peers.size === 0) {
+      rooms.delete(roomId);
+    } else {
+      broadcastToRoom(roomId, ws, "peer-left", { peerId: username });
+    }
   }
   info.roomId = null;
+
+  // ak je to aktuálny socket používateľa → vymaž ho
+  if (username && users.get(username) === ws) {
+    users.delete(username);
+  }
 }
 
 wss.on("connection", (ws) => {
-  const id = uuid();
+  const id = uuid(); // iba interné ID
   meta.set(ws, { id, roomId: null, username: null });
   console.log("🔌 Client connected:", id);
 
@@ -61,15 +70,27 @@ wss.on("connection", (ws) => {
     if (type === "join") {
       const { roomId, username } = data;
       meta.get(ws).roomId = roomId;
-      meta.get(ws).username = username || null; // uložíme username
+      meta.get(ws).username = username || null;
+
       if (!rooms.has(roomId)) rooms.set(roomId, new Set());
       rooms.get(roomId).add(ws);
-      console.log(`👥 ${id} joined room ${roomId} as ${username || "unknown"}`);
+
+      // ✅ ak už tento user bol pripojený, zavri starý socket
+      const old = users.get(username);
+      if (old && old !== ws) {
+        try { old.close(); } catch {}
+      }
+
+      // ✅ ulož aktuálny socket pre usera
+      users.set(username, ws);
+
+      console.log(`👥 ${username} joined room ${roomId}`);
 
       broadcastToRoom(roomId, ws, "peer-joined", {
-        peerId: id,
-        username: username || null,
+        peerId: username,
+        username,
       });
+
       return;
     }
 
@@ -79,41 +100,38 @@ wss.on("connection", (ws) => {
     if (!roomId || !rooms.has(roomId)) return;
 
     // VOLANIE
-   // call
-if (type === "call") {
-  const { callId } = data;
-  broadcastToRoom(roomId, ws, "incoming-call", {
-    from: id,
-    roomId,
-    callId,                        // ✅ vždy pošli callId
-    username: username || "Client",
-  });
-  return;
-}
-
-// accept
-if (type === "accept") {
-  const { callId } = data;
-  broadcastToRoom(roomId, ws, "call-accepted", {
-    from: id,
-    callId,                        // ✅ a späť tiež s callId
-  });
-  return;
-}
-
-
-    if (type === "reject") {
-      broadcastToRoom(roomId, ws, "call-rejected", { from: id });
+    if (type === "call") {
+      const { callId } = data;
+      broadcastToRoom(roomId, ws, "incoming-call", {
+        from: username,
+        roomId,
+        callId,
+      });
       return;
     }
+
+    if (type === "accept") {
+      const { callId } = data;
+      broadcastToRoom(roomId, ws, "call-accepted", {
+        from: username,
+        callId,
+      });
+      return;
+    }
+
+    if (type === "reject") {
+      broadcastToRoom(roomId, ws, "call-rejected", { from: username });
+      return;
+    }
+
     if (type === "hangup") {
-      broadcastToRoom(roomId, ws, "call-ended", { from: id });
+      broadcastToRoom(roomId, ws, "call-ended", { from: username });
       return;
     }
 
     // SDP/ICE
     if (["offer", "answer", "candidate"].includes(type)) {
-      broadcastToRoom(roomId, ws, type, { from: id, ...data });
+      broadcastToRoom(roomId, ws, type, { from: username, ...data });
       return;
     }
 
