@@ -101,16 +101,15 @@ wss.on("connection", (ws) => {
 
     // VOLANIE
     if (type === "call") {
-  const { callId, callerName } = data; // 👈 vytiahni aj callerName
-  broadcastToRoom(roomId, ws, "incoming-call", {
-    from: username,
-    callerName: callerName || username, // 👈 teraz je definované
-    roomId,
-    callId,
-  });
-  return;
-}
-
+      const { callId, callerName } = data;
+      broadcastToRoom(roomId, ws, "incoming-call", {
+        from: username,
+        callerName: callerName || username,
+        roomId,
+        callId,
+      });
+      return;
+    }
 
     if (type === "accept") {
       const { callId } = data;
@@ -122,12 +121,17 @@ wss.on("connection", (ws) => {
     }
 
     if (type === "reject") {
-      broadcastToRoom(roomId, ws, "call-rejected", { from: username });
+      const { callId } = data;
+      broadcastToRoom(roomId, ws, "call-rejected", {
+        from: username,
+        callId,
+      });
       return;
     }
 
     if (type === "hangup") {
-      broadcastToRoom(roomId, ws, "call-ended", { from: username });
+      const { callId } = data;
+      broadcastToRoom(roomId, ws, "call-ended", { from: username, callId });
       return;
     }
 
