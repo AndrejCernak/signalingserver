@@ -7,11 +7,12 @@ const server = createServer((req, res) => {
   res.end("WebRTC signaling server ✅");
 });
 
-const wss = new WebSocketServer({ server });
+// 👇 DÔLEŽITÁ OPRAVA — route musí byť definovaná
+const wss = new WebSocketServer({ server, path: "/ws" });
 
-const rooms = new Map(); // roomId -> Set<ws>
-const meta = new Map();  // ws -> { id, roomId, username }
-const users = new Map(); // username -> ws (aktuálny socket)
+const rooms = new Map();
+const meta = new Map();
+const users = new Map();
 
 function send(ws, type, payload = {}) {
   if (ws.readyState === ws.OPEN) {
@@ -38,22 +39,19 @@ function leaveRoom(ws) {
   const peers = rooms.get(roomId);
   if (peers) {
     peers.delete(ws);
-    if (peers.size === 0) {
-      rooms.delete(roomId);
-    } else {
-      broadcastToRoom(roomId, ws, "peer-left", { peerId: username });
-    }
+    if (peers.size === 0) rooms.delete(roomId);
+    else broadcastToRoom(roomId, ws, "peer-left", { peerId: username });
   }
+
   info.roomId = null;
 
-  // ak je to aktuálny socket používateľa → vymaž ho
   if (username && users.get(username) === ws) {
     users.delete(username);
   }
 }
 
 wss.on("connection", (ws) => {
-  const id = uuid(); // iba interné ID
+  const id = uuid();
   meta.set(ws, { id, roomId: null, username: null });
   console.log("🔌 Client connected:", id);
 
@@ -66,22 +64,21 @@ wss.on("connection", (ws) => {
     }
 
     const { type } = data;
+    const info = meta.get(ws);
 
     if (type === "join") {
       const { roomId, username } = data;
-      meta.get(ws).roomId = roomId;
-      meta.get(ws).username = username || null;
+      info.roomId = roomId;
+      info.username = username || null;
 
       if (!rooms.has(roomId)) rooms.set(roomId, new Set());
       rooms.get(roomId).add(ws);
 
-      // ✅ ak už tento user bol pripojený, zavri starý socket
       const old = users.get(username);
       if (old && old !== ws) {
         try { old.close(); } catch {}
       }
 
-      // ✅ ulož aktuálny socket pre usera
       users.set(username, ws);
 
       console.log(`👥 ${username} joined room ${roomId}`);
@@ -90,16 +87,13 @@ wss.on("connection", (ws) => {
         peerId: username,
         username,
       });
-
       return;
     }
 
-    const info = meta.get(ws);
     const roomId = info.roomId;
     const username = info.username;
     if (!roomId || !rooms.has(roomId)) return;
 
-    // VOLANIE
     if (type === "call") {
       const { callId, callerName } = data;
       broadcastToRoom(roomId, ws, "incoming-call", {
@@ -112,30 +106,29 @@ wss.on("connection", (ws) => {
     }
 
     if (type === "accept") {
-      const { callId } = data;
       broadcastToRoom(roomId, ws, "call-accepted", {
         from: username,
-        callId,
+        callId: data.callId,
       });
       return;
     }
 
     if (type === "reject") {
-      const { callId } = data;
       broadcastToRoom(roomId, ws, "call-rejected", {
         from: username,
-        callId,
+        callId: data.callId,
       });
       return;
     }
 
     if (type === "hangup") {
-      const { callId } = data;
-      broadcastToRoom(roomId, ws, "call-ended", { from: username, callId });
+      broadcastToRoom(roomId, ws, "call-ended", {
+        from: username,
+        callId: data.callId,
+      });
       return;
     }
 
-    // SDP/ICE
     if (["offer", "answer", "candidate"].includes(type)) {
       broadcastToRoom(roomId, ws, type, { from: username, ...data });
       return;
@@ -154,4 +147,4 @@ wss.on("connection", (ws) => {
 });
 
 const PORT = process.env.PORT || 10000;
-server.listen(PORT, () => console.log(`🚀 Signaling on :${PORT}`));
+server.listen(PORT, () => console.log(`🚀 Signaling on :${PORT}/ws`));
