@@ -7,12 +7,12 @@ const server = createServer((req, res) => {
   res.end("WebRTC signaling server ✅");
 });
 
-// 👇 DÔLEŽITÁ OPRAVA — route musí byť definovaná
 const wss = new WebSocketServer({ server, path: "/ws" });
 
-const rooms = new Map();
-const meta = new Map();
-const users = new Map();
+const rooms = new Map();        // roomId → Set(ws)
+const meta = new Map();         // ws → { id, roomId, username }
+const users = new Map();        // username → ws
+const activeCalls = new Map();  // callId → { roomId, caller, callee }
 
 function send(ws, type, payload = {}) {
   if (ws.readyState === ws.OPEN) {
@@ -20,11 +20,12 @@ function send(ws, type, payload = {}) {
   }
 }
 
-function broadcastToRoom(roomId, exceptWs, type, payload = {}) {
+function broadcastToRoom(roomId, except, type, payload = {}) {
   const peers = rooms.get(roomId);
   if (!peers) return;
+
   for (const client of peers) {
-    if (client !== exceptWs && client.readyState === client.OPEN) {
+    if (client !== except && client.readyState === client.OPEN) {
       send(client, type, payload);
     }
   }
@@ -33,11 +34,11 @@ function broadcastToRoom(roomId, exceptWs, type, payload = {}) {
 function leaveRoom(ws) {
   const info = meta.get(ws);
   if (!info) return;
-  const { roomId, username } = info;
-  if (!roomId) return;
 
-  const peers = rooms.get(roomId);
-  if (peers) {
+  const { roomId, username } = info;
+
+  if (roomId && rooms.has(roomId)) {
+    const peers = rooms.get(roomId);
     peers.delete(ws);
     if (peers.size === 0) rooms.delete(roomId);
     else broadcastToRoom(roomId, ws, "peer-left", { peerId: username });
@@ -57,28 +58,26 @@ wss.on("connection", (ws) => {
 
   ws.on("message", (msg) => {
     let data;
-    try {
-      data = JSON.parse(msg.toString());
-    } catch {
-      return;
-    }
+    try { data = JSON.parse(msg.toString()); }
+    catch { return; }
 
     const { type } = data;
     const info = meta.get(ws);
 
+    // JOIN ---------------------------------------------------------------------
     if (type === "join") {
       const { roomId, username } = data;
+
       info.roomId = roomId;
-      info.username = username || null;
+      info.username = username ?? null;
 
       if (!rooms.has(roomId)) rooms.set(roomId, new Set());
       rooms.get(roomId).add(ws);
 
-      const old = users.get(username);
-      if (old && old !== ws) {
-        try { old.close(); } catch {}
+      const oldSocket = users.get(username);
+      if (oldSocket && oldSocket !== ws) {
+        try { oldSocket.close(); } catch {}
       }
-
       users.set(username, ws);
 
       console.log(`👥 ${username} joined room ${roomId}`);
@@ -90,12 +89,24 @@ wss.on("connection", (ws) => {
       return;
     }
 
-    const roomId = info.roomId;
-    const username = info.username;
+    const { roomId, username } = info;
     if (!roomId || !rooms.has(roomId)) return;
 
+    // CALL ---------------------------------------------------------------------
     if (type === "call") {
       const { callId, callerName } = data;
+
+      // Ulož call stav
+      const peers = [...rooms.get(roomId)];
+      const calleeWs = peers.find((p) => p !== ws);
+      const callee = calleeWs ? meta.get(calleeWs).username : null;
+
+      activeCalls.set(callId, {
+        roomId,
+        caller: username,
+        callee,
+      });
+
       broadcastToRoom(roomId, ws, "incoming-call", {
         from: username,
         callerName: callerName || username,
@@ -105,37 +116,51 @@ wss.on("connection", (ws) => {
       return;
     }
 
+    // ACCEPT -------------------------------------------------------------------
     if (type === "accept") {
-      broadcastToRoom(roomId, ws, "call-accepted", {
-        from: username,
-        callId: data.callId,
-      });
+      const { callId } = data;
+      broadcastToRoom(roomId, ws, "call-accepted", { from: username, callId });
       return;
     }
 
+    // REJECT (CALLEE odmietol hovor) -------------------------------------------
     if (type === "reject") {
-      broadcastToRoom(roomId, ws, "call-rejected", {
-        from: username,
-        callId: data.callId,
-      });
-      return;
-    }
+      const { callId } = data;
+      console.log(`⛔ Call rejected by ${username} (${callId})`);
 
-    if (type === "hangup") {
       broadcastToRoom(roomId, ws, "call-ended", {
         from: username,
-        callId: data.callId,
+        callId,
       });
+
+      activeCalls.delete(callId);
       return;
     }
 
+    // HANGUP (caller alebo callee ukončil) -------------------------------------
+    if (type === "hangup") {
+      const { callId } = data;
+      console.log(`🛑 Hangup from ${username} (${callId})`);
+
+      broadcastToRoom(roomId, ws, "call-ended", {
+        from: username,
+        callId,
+      });
+
+      activeCalls.delete(callId);
+      return;
+    }
+
+    // OFFER / ANSWER / ICE -----------------------------------------------------
     if (["offer", "answer", "candidate"].includes(type)) {
       broadcastToRoom(roomId, ws, type, { from: username, ...data });
       return;
     }
 
+    // LEAVE --------------------------------------------------------------------
     if (type === "leave") {
       leaveRoom(ws);
+      return;
     }
   });
 
