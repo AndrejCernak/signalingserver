@@ -94,27 +94,30 @@ wss.on("connection", (ws) => {
 
     // CALL ---------------------------------------------------------------------
     if (type === "call") {
-      const { callId, callerName } = data;
+    const { callId, callerName } = data;
+  
+    // 🔥 ULOŽ MENO VOLAJÚCEHO NA SOCKET
+    info.callerName = callerName || info.username;
+  
+    const peers = [...rooms.get(roomId)];
+    const calleeWs = peers.find((p) => p !== ws);
+    const callee = calleeWs ? meta.get(calleeWs).username : null;
+  
+    activeCalls.set(callId, {
+      roomId,
+      caller: username,
+      callee,
+    });
+  
+    broadcastToRoom(roomId, ws, "incoming-call", {
+      from: username,
+      callerName: info.callerName, // ✅ VŽDY REÁLNE MENO
+      roomId,
+      callId,
+    });
+    return;
+  }
 
-      // Ulož call stav
-      const peers = [...rooms.get(roomId)];
-      const calleeWs = peers.find((p) => p !== ws);
-      const callee = calleeWs ? meta.get(calleeWs).username : null;
-
-      activeCalls.set(callId, {
-        roomId,
-        caller: username,
-        callee,
-      });
-
-      broadcastToRoom(roomId, ws, "incoming-call", {
-        from: username,
-        callerName: callerName || username,
-        roomId,
-        callId,
-      });
-      return;
-    }
 
     // ACCEPT -------------------------------------------------------------------
     if (type === "accept") {
