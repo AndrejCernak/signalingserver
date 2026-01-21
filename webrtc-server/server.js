@@ -1,7 +1,6 @@
 import { WebSocketServer } from "ws";
 import { createServer } from "http";
 import { v4 as uuid } from "uuid";
-import fetch from "node-fetch";
 
 // -----------------------------------------------------------------------------
 // HTTP SERVER
@@ -91,6 +90,7 @@ async function saveChatToFrappe({ from, to, content, roomId }) {
     console.error("❌ Failed to save chat to Frappe:", err);
   }
 }
+
 
 // -----------------------------------------------------------------------------
 // CONNECTION
