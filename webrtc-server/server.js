@@ -20,8 +20,12 @@ const wss = new WebSocketServer({ server, path: "/ws" });
 // -----------------------------------------------------------------------------
 const rooms = new Map();         // roomId → Set(ws)
 const meta = new Map();          // ws → { id, roomId, username, callerName }
-const users = new Map();         // username (Clerk ID) → ws
+const users = new Map();         // username → ws
 const activeCalls = new Map();   // callId → { roomId, caller, callee }
+
+// 🔹 TEMP CHAT QUEUE (ACK-based)
+const pendingMessages = new Map();
+// username → Map(messageId → message)
 
 // -----------------------------------------------------------------------------
 // HELPERS
@@ -64,35 +68,6 @@ function leaveRoom(ws) {
 }
 
 // -----------------------------------------------------------------------------
-// SAVE CHAT MESSAGE TO FRAPPE (ASYNC)
-// -----------------------------------------------------------------------------
-async function saveChatToFrappe({ from, to, content, roomId }) {
-  try {
-    const res = await fetch(
-      "https://bcservices.f.frappe.cloud/api/method/bcservices.api.chat.save_message",
-      {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/x-www-form-urlencoded",
-        },
-        body: new URLSearchParams({
-          from_clerk: from,
-          to_clerk: to,
-          content,
-          room_id: roomId || "",
-        }),
-      }
-    );
-
-    const json = await res.json();
-    console.log("💾 Chat saved to Frappe:", json);
-  } catch (err) {
-    console.error("❌ Failed to save chat to Frappe:", err);
-  }
-}
-
-
-// -----------------------------------------------------------------------------
 // CONNECTION
 // -----------------------------------------------------------------------------
 wss.on("connection", (ws) => {
@@ -100,7 +75,7 @@ wss.on("connection", (ws) => {
   meta.set(ws, { id, roomId: null, username: null });
   console.log("🔌 Client connected:", id);
 
-  ws.on("message", async (msg) => {
+  ws.on("message", (msg) => {
     let data;
     try {
       data = JSON.parse(msg.toString());
@@ -135,6 +110,16 @@ wss.on("connection", (ws) => {
         peerId: username,
         username,
       });
+
+      // 🔹 SEND PENDING MESSAGES (do NOT delete yet – wait for ACK)
+      const queued = pendingMessages.get(username);
+      if (queued) {
+        for (const msg of queued.values()) {
+          send(ws, "chat-message", msg);
+        }
+        console.log(`📤 Sent ${queued.size} queued messages to ${username}`);
+      }
+
       return;
     }
 
@@ -142,35 +127,60 @@ wss.on("connection", (ws) => {
     // CHAT MESSAGE
     // -------------------------------------------------------------------------
     if (type === "chat-message") {
-  const { to, content, kind = "text", filename = null } = data;
-  const from = info.username;
-  const roomId = info.roomId;
+      const {
+        to,
+        content,
+        kind = "text",
+        filename = null,
+        messageId
+      } = data;
 
-  console.log(`💬 Chat: ${from} -> ${to} [${kind}]`);
+      const from = info.username;
 
-  // realtime delivery
-  const recipientWs = users.get(to);
-  if (recipientWs) {
-    send(recipientWs, "chat-message", {
-      from,
-      content,
-      kind,
-      filename,
-      timestamp: new Date().toISOString()
-    });
-  } else {
-    console.log(`⚠️ ${to} offline → message only in history`);
-  }
+      const msg = {
+        messageId,
+        from,
+        to,
+        content,
+        kind,
+        filename,
+        timestamp: new Date().toISOString()
+      };
 
-  // async save to frappe
-  saveChatToFrappe({
-    from,
-    to,
-    content,
-    roomId,
-    kind,
-    filename
-  });
+      const recipientWs = users.get(to);
+
+      // 🔹 ONLINE → send immediately
+      if (recipientWs) {
+        send(recipientWs, "chat-message", msg);
+      }
+
+      // 🔹 ALWAYS store in queue until ACK
+      if (!pendingMessages.has(to)) {
+        pendingMessages.set(to, new Map());
+      }
+      pendingMessages.get(to).set(messageId, msg);
+
+      console.log(`💬 ${from} → ${to} (${messageId}) queued`);
+
+      return;
+    }
+
+    // -------------------------------------------------------------------------
+    // CHAT ACK
+    // -------------------------------------------------------------------------
+    if (type === "chat-ack") {
+      const { messageId } = data;
+      const username = info.username;
+
+      const queue = pendingMessages.get(username);
+      if (queue && queue.has(messageId)) {
+        queue.delete(messageId);
+        console.log(`✅ ACK from ${username}, removed ${messageId}`);
+        if (queue.size === 0) {
+          pendingMessages.delete(username);
+        }
+      }
+
       return;
     }
 
