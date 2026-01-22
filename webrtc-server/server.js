@@ -142,33 +142,35 @@ wss.on("connection", (ws) => {
     // CHAT MESSAGE
     // -------------------------------------------------------------------------
     if (type === "chat-message") {
-      const { to, content, fromName } = data;
-      const from = info.username;
-      const roomId = info.roomId;
+  const { to, content, kind = "text", filename = null } = data;
+  const from = info.username;
+  const roomId = info.roomId;
 
-      console.log(`💬 Chat: ${from} -> ${to}: ${content}`);
+  console.log(`💬 Chat: ${from} -> ${to} [${kind}]`);
 
-      // realtime delivery
-      const recipientWs = users.get(to);
-      if (recipientWs) {
-        send(recipientWs, "chat-message", {
-          from,
-          fromName: fromName || from,
-          content,
-          timestamp: new Date().toISOString(),
-        });
-      } else {
-        console.log(`⚠️ ${to} offline → message only in history`);
-      }
+  // realtime delivery
+  const recipientWs = users.get(to);
+  if (recipientWs) {
+    send(recipientWs, "chat-message", {
+      from,
+      content,
+      kind,
+      filename,
+      timestamp: new Date().toISOString()
+    });
+  } else {
+    console.log(`⚠️ ${to} offline → message only in history`);
+  }
 
-      // async save to frappe
-      saveChatToFrappe({
-        from,
-        to,
-        content,
-        roomId,
-      });
-
+  // async save to frappe
+  saveChatToFrappe({
+    from,
+    to,
+    content,
+    roomId,
+    kind,
+    filename
+  });
       return;
     }
 
