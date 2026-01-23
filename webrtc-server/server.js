@@ -1,8 +1,9 @@
 import { WebSocketServer } from "ws";
 import { createServer } from "http";
 import { v4 as uuid } from "uuid";
-import { S3Client, PutObjectCommand } from "@aws-sdk/client-s3";
+import { S3Client, PutObjectCommand, GetObjectCommand } from "@aws-sdk/client-s3";
 import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
+
 
 /* ============================================================================
    HTTP SERVER
@@ -213,6 +214,36 @@ wss.on("connection", (ws) => {
 
     const { roomId, username } = info;
     if (!roomId || !rooms.has(roomId)) return;
+
+
+     if (req.method === "POST" && req.url === "/download-url") {
+  let body = "";
+
+  req.on("data", chunk => body += chunk);
+
+  req.on("end", async () => {
+    try {
+      const { key } = JSON.parse(body);
+
+      const command = new GetObjectCommand({
+        Bucket: process.env.S3_BUCKET,
+        Key: key
+      });
+
+      const downloadUrl = await getSignedUrl(s3, command, {
+        expiresIn: 60 * 5 // 5 minút
+      });
+
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ downloadUrl }));
+
+    } catch (err) {
+      console.error("❌ download-url error:", err);
+      res.writeHead(500);
+      res.end("error");
+    }
+  });
+}
 
     /* -----------------------------------------------------------------------
        CALLS (UNTOUCHED)
