@@ -20,13 +20,23 @@ const s3 = new S3Client({
 });
 
 /* ============================================================================
-   HTTP SERVER
+   HELPERS
 ============================================================================ */
-const server = createServer(async (req, res) => {
+function safeFilename(name) {
+  return name
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .replace(/[^a-zA-Z0-9._-]/g, "_");
+}
 
-  // -------------------------
+/* ============================================================================
+   HTTP SERVER (UPLOAD / DOWNLOAD)
+============================================================================ */
+const server = createServer((req, res) => {
+
+  // --------------------------------------------------------------------------
   // UPLOAD URL
-  // -------------------------
+  // --------------------------------------------------------------------------
   if (req.method === "POST" && req.url === "/upload-url") {
     let body = "";
 
@@ -35,7 +45,10 @@ const server = createServer(async (req, res) => {
       try {
         const { filename, contentType } = JSON.parse(body);
 
-        const key = `chat/${Date.now()}-${filename}`;
+        const safeName = safeFilename(filename);
+        const key = `chat/${Date.now()}-${safeName}`;
+
+        console.log("📤 Upload requested:", key);
 
         const command = new PutObjectCommand({
           Bucket: process.env.AWS_S3_BUCKET,
@@ -43,27 +56,22 @@ const server = createServer(async (req, res) => {
           ContentType: contentType
         });
 
-        const uploadUrl = await getSignedUrl(s3, command, {
-          expiresIn: 60
-        });
+        const uploadUrl = await getSignedUrl(s3, command, { expiresIn: 60 });
 
         res.writeHead(200, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({
-          uploadUrl,
-          key
-        }));
+        res.end(JSON.stringify({ uploadUrl, key }));
+
       } catch (err) {
         console.error("❌ upload-url error:", err);
-        res.writeHead(500);
-        res.end("error");
+        res.writeHead(500).end("error");
       }
     });
     return;
   }
 
-  // -------------------------
+  // --------------------------------------------------------------------------
   // DOWNLOAD URL
-  // -------------------------
+  // --------------------------------------------------------------------------
   if (req.method === "POST" && req.url === "/download-url") {
     let body = "";
 
@@ -72,9 +80,12 @@ const server = createServer(async (req, res) => {
       try {
         const { key } = JSON.parse(body);
 
+        console.log("📥 Download requested:", key);
+
         const command = new GetObjectCommand({
           Bucket: process.env.AWS_S3_BUCKET,
-          Key: key
+          Key: key,
+          ResponseContentDisposition: "attachment"
         });
 
         const downloadUrl = await getSignedUrl(s3, command, {
@@ -83,18 +94,15 @@ const server = createServer(async (req, res) => {
 
         res.writeHead(200, { "Content-Type": "application/json" });
         res.end(JSON.stringify({ downloadUrl }));
+
       } catch (err) {
         console.error("❌ download-url error:", err);
-        res.writeHead(500);
-        res.end("error");
+        res.writeHead(500).end("error");
       }
     });
     return;
   }
 
-  // -------------------------
-  // DEFAULT
-  // -------------------------
   res.writeHead(200);
   res.end("WebRTC & Chat signaling server ✅");
 });
@@ -107,11 +115,10 @@ const wss = new WebSocketServer({ server, path: "/ws" });
 /* ============================================================================
    STATE
 ============================================================================ */
-const rooms = new Map();
-const meta = new Map();
-const users = new Map();
-const activeCalls = new Map();
-const pendingMessages = new Map();
+const rooms = new Map();            // roomId -> Set(ws)
+const meta = new Map();             // ws -> { id, roomId, username }
+const users = new Map();            // username -> ws
+const pendingMessages = new Map();  // username -> Map(messageId -> message)
 
 /* ============================================================================
    HELPERS
@@ -122,40 +129,13 @@ function send(ws, type, payload = {}) {
   }
 }
 
-function broadcastToRoom(roomId, except, type, payload = {}) {
-  const peers = rooms.get(roomId);
-  if (!peers) return;
-  for (const client of peers) {
-    if (client !== except && client.readyState === client.OPEN) {
-      send(client, type, payload);
-    }
-  }
-}
-
-function leaveRoom(ws) {
-  const info = meta.get(ws);
-  if (!info) return;
-
-  const { roomId, username } = info;
-
-  if (roomId && rooms.has(roomId)) {
-    const peers = rooms.get(roomId);
-    peers.delete(ws);
-    if (peers.size === 0) rooms.delete(roomId);
-  }
-
-  if (username && users.get(username) === ws) {
-    users.delete(username);
-  }
-}
-
 /* ============================================================================
    WS CONNECTION
 ============================================================================ */
 wss.on("connection", (ws) => {
   const id = uuid();
   meta.set(ws, { id, roomId: null, username: null });
-  console.log("🔌 Client connected:", id);
+  console.log("🔌 WS connected:", id);
 
   ws.on("message", (raw) => {
     let data;
@@ -168,7 +148,9 @@ wss.on("connection", (ws) => {
     const { type } = data;
     const info = meta.get(ws);
 
+    // ------------------------------------------------------------------------
     // JOIN
+    // ------------------------------------------------------------------------
     if (type === "join") {
       const { roomId, username } = data;
 
@@ -180,18 +162,23 @@ wss.on("connection", (ws) => {
 
       users.set(username, ws);
 
-      const queued = pendingMessages.get(username);
-      if (queued) {
-        for (const msg of queued.values()) {
+      console.log(`👤 ${username} joined ${roomId}`);
+
+      const queue = pendingMessages.get(username);
+      if (queue) {
+        console.log(`📦 Delivering ${queue.size} queued messages to ${username}`);
+        for (const msg of queue.values()) {
           send(ws, "chat-message", msg);
         }
       }
       return;
     }
 
+    // ------------------------------------------------------------------------
     // CHAT MESSAGE
+    // ------------------------------------------------------------------------
     if (type === "chat-message") {
-      const { to, content, kind = "text", filename, messageId } = data;
+      const { to, content, kind, filename, messageId } = data;
       const from = info.username;
 
       const msg = {
@@ -204,26 +191,54 @@ wss.on("connection", (ws) => {
         timestamp: new Date().toISOString()
       };
 
-      const recipient = users.get(to);
-      if (recipient) send(recipient, "chat-message", msg);
+      console.log(`💬 ${from} → ${to} (${kind})`);
 
-      if (!pendingMessages.has(to)) pendingMessages.set(to, new Map());
+      const recipient = users.get(to);
+
+      if (recipient) {
+        send(recipient, "chat-message", msg);
+        console.log("📨 Delivered live");
+      } else {
+        console.log("📦 Recipient offline, queued");
+      }
+
+      if (!pendingMessages.has(to)) {
+        pendingMessages.set(to, new Map());
+      }
       pendingMessages.get(to).set(messageId, msg);
+
+      console.log(`📊 Queue size for ${to}: ${pendingMessages.get(to).size}`);
       return;
     }
 
+    // ------------------------------------------------------------------------
     // ACK
+    // ------------------------------------------------------------------------
     if (type === "chat-ack") {
-      const queue = pendingMessages.get(info.username);
-      if (queue) queue.delete(data.messageId);
+      const { messageId } = data;
+      const user = info.username;
+
+      const queue = pendingMessages.get(user);
+      if (queue && queue.has(messageId)) {
+        queue.delete(messageId);
+        console.log(`✅ ACK from ${user} for ${messageId}`);
+
+        if (queue.size === 0) {
+          pendingMessages.delete(user);
+          console.log(`🧹 Queue cleared for ${user}`);
+        }
+      }
       return;
     }
   });
 
   ws.on("close", () => {
-    leaveRoom(ws);
+    const info = meta.get(ws);
+    if (info?.username) {
+      users.delete(info.username);
+      console.log(`❌ ${info.username} disconnected`);
+    }
     meta.delete(ws);
-    console.log("❌ Client disconnected:", id);
   });
 });
 
