@@ -49,25 +49,25 @@ function broadcastToRoom(roomId, except, type, payload = {}) {
    HTTP SERVER (UPLOAD / DOWNLOAD)
 ============================================================================ */
 const server = createServer((req, res) => {
-
   // UPLOAD URL
   if (req.method === "POST" && req.url === "/upload-url") {
     let body = "";
     req.on("data", c => body += c);
     req.on("end", async () => {
-      const { filename, contentType } = JSON.parse(body);
-      const key = `chat/${Date.now()}-${safeFilename(filename)}`;
-
-      console.log("📤 Upload URL:", key);
-
-      const cmd = new PutObjectCommand({
-        Bucket: process.env.AWS_S3_BUCKET,
-        Key: key,
-        ContentType: contentType
-      });
-
-      const uploadUrl = await getSignedUrl(s3, cmd, { expiresIn: 60 });
-      res.end(JSON.stringify({ uploadUrl, key }));
+      try {
+        const { filename, contentType } = JSON.parse(body);
+        const key = `chat/${Date.now()}-${safeFilename(filename)}`;
+        console.log("📤 Upload URL:", key);
+        const cmd = new PutObjectCommand({
+          Bucket: process.env.AWS_S3_BUCKET,
+          Key: key,
+          ContentType: contentType
+        });
+        const uploadUrl = await getSignedUrl(s3, cmd, { expiresIn: 60 });
+        res.end(JSON.stringify({ uploadUrl, key }));
+      } catch (e) {
+        res.writeHead(500); res.end(e.toString());
+      }
     });
     return;
   }
@@ -77,18 +77,19 @@ const server = createServer((req, res) => {
     let body = "";
     req.on("data", c => body += c);
     req.on("end", async () => {
-      const { key } = JSON.parse(body);
-
-      console.log("📥 Download URL:", key);
-
-      const cmd = new GetObjectCommand({
-        Bucket: process.env.AWS_S3_BUCKET,
-        Key: key,
-        ResponseContentDisposition: "attachment"
-      });
-
-      const downloadUrl = await getSignedUrl(s3, cmd, { expiresIn: 300 });
-      res.end(JSON.stringify({ downloadUrl }));
+      try {
+        const { key } = JSON.parse(body);
+        console.log("📥 Download URL:", key);
+        const cmd = new GetObjectCommand({
+          Bucket: process.env.AWS_S3_BUCKET,
+          Key: key,
+          ResponseContentDisposition: "attachment"
+        });
+        const downloadUrl = await getSignedUrl(s3, cmd, { expiresIn: 300 });
+        res.end(JSON.stringify({ downloadUrl }));
+      } catch (e) {
+        res.writeHead(500); res.end(e.toString());
+      }
     });
     return;
   }
@@ -107,8 +108,10 @@ const wss = new WebSocketServer({ server, path: "/ws" });
 const rooms = new Map();            // roomId → Set(ws)
 const meta = new Map();             // ws → { id, roomId, username, callerName }
 const users = new Map();            // username → ws
-const activeCalls = new Map();      // callId → { roomId, caller, callee }
 const pendingMessages = new Map();  // username → Map(messageId → message)
+
+// 🔥 OPRAVA: Pamäť pre čakajúce hovory (ak volajúci príde skôr ako volaný)
+const pendingCalls = new Map();     // roomId → { callId, callerName, fromUsername }
 
 /* ============================================================================
    WS CONNECTION
@@ -126,7 +129,9 @@ wss.on("connection", (ws) => {
     const { type } = data;
     const info = meta.get(ws);
 
+    // ------------------------------------------------------------------------
     // JOIN
+    // ------------------------------------------------------------------------
     if (type === "join") {
       info.roomId = data.roomId;
       info.username = data.username;
@@ -134,6 +139,7 @@ wss.on("connection", (ws) => {
       if (!rooms.has(info.roomId)) rooms.set(info.roomId, new Set());
       rooms.get(info.roomId).add(ws);
 
+      // Register user globally for chat
       const old = users.get(info.username);
       if (old && old !== ws) try { old.close(); } catch {}
       users.set(info.username, ws);
@@ -145,6 +151,22 @@ wss.on("connection", (ws) => {
         username: info.username
       });
 
+      // 🔥 OPRAVA: Ak v tejto roomke čaká hovor (Pending Call), pošli ho tomuto userovi!
+      if (pendingCalls.has(info.roomId)) {
+        const callInfo = pendingCalls.get(info.roomId);
+        // Neposielať späť volajúcemu, iba novému účastníkovi
+        if (callInfo.fromUsername !== info.username) {
+            console.log(`🚀 Sending pending call in ${info.roomId} to late joiner ${info.username}`);
+            send(ws, "incoming-call", {
+                from: callInfo.fromUsername,
+                callerName: callInfo.callerName,
+                roomId: info.roomId,
+                callId: callInfo.callId
+            });
+        }
+      }
+
+      // Doručenie offline správ (Chat)
       const queue = pendingMessages.get(info.username);
       if (queue) {
         console.log(`📦 Delivering ${queue.size} queued messages`);
@@ -158,64 +180,41 @@ wss.on("connection", (ws) => {
     const { roomId, username } = info;
     if (!roomId) return;
 
-    // CHAT MESSAGE
-    if (type === "chat-message") {
-      const { to, content, kind, filename, messageId } = data;
+    // ------------------------------------------------------------------------
+    // CALL SETUP
+    // ------------------------------------------------------------------------
+    if (type === "call") {
+      info.callerName = data.callerName || username;
 
-      const msg = {
-        messageId,
-        from: username,
-        to,
-        content,
-        kind,
-        filename,
-        timestamp: new Date().toISOString()
-      };
+      // Zisti, či je v miestnosti niekto iný
+      const peers = rooms.get(roomId);
+      const otherPeers = [...peers].filter(p => p !== ws);
 
-      const recipient = users.get(to);
-      if (recipient) send(recipient, "chat-message", msg);
+      // Ulož hovor do "čakárne", ak by sa volaný pripojil neskôr
+      pendingCalls.set(roomId, {
+          callId: data.callId,
+          callerName: info.callerName,
+          fromUsername: username
+      });
 
-      if (!pendingMessages.has(to)) pendingMessages.set(to, new Map());
-      pendingMessages.get(to).set(messageId, msg);
-
-      console.log(`💬 ${username} → ${to} (${kind})`);
-      return;
-    }
-
-    // ACK
-    if (type === "chat-ack") {
-      const queue = pendingMessages.get(username);
-      if (queue?.delete(data.messageId)) {
-        console.log(`✅ ACK ${username} ${data.messageId}`);
-        if (queue.size === 0) pendingMessages.delete(username);
+      // Ak je už niekto v miestnosti, pošli mu to hneď
+      if (otherPeers.length > 0) {
+          broadcastToRoom(roomId, ws, "incoming-call", {
+            from: username,
+            callerName: info.callerName,
+            roomId,
+            callId: data.callId
+          });
+      } else {
+          console.log(`⏳ Call stored for room ${roomId} (waiting for peer)`);
       }
       return;
     }
 
-    // CALL
-    if (type === "call") {
-      info.callerName = data.callerName || username;
-
-      const peers = [...rooms.get(roomId)];
-      const calleeWs = peers.find(p => p !== ws);
-      const callee = calleeWs ? meta.get(calleeWs).username : null;
-
-      activeCalls.set(data.callId, {
-        roomId,
-        caller: username,
-        callee
-      });
-
-      broadcastToRoom(roomId, ws, "incoming-call", {
-        from: username,
-        callerName: info.callerName,
-        roomId,
-        callId: data.callId
-      });
-      return;
-    }
-
     if (type === "accept") {
+      // Keď je hovor prijatý, vymažeme ho z čakárne
+      pendingCalls.delete(roomId);
+
       broadcastToRoom(roomId, ws, "call-accepted", {
         from: username,
         callId: data.callId
@@ -224,14 +223,18 @@ wss.on("connection", (ws) => {
     }
 
     if (type === "reject" || type === "hangup") {
+      pendingCalls.delete(roomId);
+      
       broadcastToRoom(roomId, ws, "call-ended", {
         from: username,
         callId: data.callId
       });
-      activeCalls.delete(data.callId);
       return;
     }
 
+    // ------------------------------------------------------------------------
+    // WEBRTC SIGNALING
+    // ------------------------------------------------------------------------
     if (["offer", "answer", "candidate"].includes(type)) {
       broadcastToRoom(roomId, ws, type, {
         from: username,
@@ -240,10 +243,41 @@ wss.on("connection", (ws) => {
       return;
     }
 
+    // ------------------------------------------------------------------------
+    // CHAT
+    // ------------------------------------------------------------------------
+    if (type === "chat-message") {
+      const { to, content, kind, filename, messageId } = data;
+      const msg = {
+        messageId, from: username, to, content, kind, filename,
+        timestamp: new Date().toISOString()
+      };
+
+      const recipient = users.get(to);
+      if (recipient) send(recipient, "chat-message", msg);
+
+      if (!pendingMessages.has(to)) pendingMessages.set(to, new Map());
+      pendingMessages.get(to).set(messageId, msg);
+      return;
+    }
+
+    if (type === "chat-ack") {
+      const queue = pendingMessages.get(username);
+      if (queue?.delete(data.messageId)) {
+        if (queue.size === 0) pendingMessages.delete(username);
+      }
+      return;
+    }
+
     if (type === "leave") {
       broadcastToRoom(roomId, ws, "peer-left", { peerId: username });
       rooms.get(roomId)?.delete(ws);
       users.delete(username);
+      // Ak odíde volajúci, zruš pending call
+      const pending = pendingCalls.get(roomId);
+      if (pending && pending.fromUsername === username) {
+          pendingCalls.delete(roomId);
+      }
     }
   });
 
@@ -254,6 +288,12 @@ wss.on("connection", (ws) => {
         peerId: info.username
       });
       rooms.get(info.roomId)?.delete(ws);
+      
+      // Cleanup pending calls if the caller disconnects
+      const pending = pendingCalls.get(info.roomId);
+      if (pending && pending.fromUsername === info.username) {
+          pendingCalls.delete(info.roomId);
+      }
     }
     users.delete(info?.username);
     meta.delete(ws);
