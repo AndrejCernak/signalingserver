@@ -19,6 +19,8 @@ const s3 = new S3Client({
   }
 });
 
+const FRAPPE_NOTIFY_URL = "https://bcservices.f.frappe.cloud/api/method/bcservices.api.notify.send_notification";
+
 /* ============================================================================
    HELPERS
 ============================================================================ */
@@ -254,8 +256,33 @@ wss.on("connection", (ws) => {
       };
 
       const recipient = users.get(to);
-      if (recipient) send(recipient, "chat-message", msg);
 
+      // --- LOGIKA PRE PUSH ---
+      if (recipient && recipient.readyState === recipient.OPEN) {
+        // Používateľ je online, doručíme správu cez WebSocket
+        send(recipient, "chat-message", msg);
+      } else {
+        // Používateľ je OFFLINE -> zavoláme Frappe, aby poslal Push
+        console.log(`📡 User ${to} is offline. Triggering APNs via Frappe...`);
+        
+        fetch(FRAPPE_NOTIFY_URL, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, 
+          // Frappe whitelist endpointy majú radi form-data alebo urlencoded
+          body: new URLSearchParams({
+            "to_user": to,
+            "from_user": username,
+            "from_name": info.username || "Niekto", // 'info' je meta dáta odosielateľa
+            "content": kind === 'file' ? "📎 Poslal vám súbor" : content
+          })
+        })
+        .then(res => res.json())
+        .then(json => console.log("✅ Frappe notify response:", json))
+        .catch(err => console.error("❌ Frappe notify failed:", err));
+      }
+      // --- KONIEC LOGIKY PRE PUSH ---
+
+      // Tvoja pôvodná fronta správ pre neskoršie doručenie
       if (!pendingMessages.has(to)) pendingMessages.set(to, new Map());
       pendingMessages.get(to).set(messageId, msg);
       return;
