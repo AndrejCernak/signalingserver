@@ -1,5 +1,6 @@
 import { WebSocketServer } from "ws";
 import { createServer } from "http";
+import https from "https"; // 🔥 PRIDANÉ: Import pre natívne HTTPS
 import { v4 as uuid } from "uuid";
 import {
   S3Client,
@@ -33,7 +34,6 @@ function safeFilename(name) {
 
 function send(ws, type, payload = {}) {
   if (ws && ws.readyState === ws.OPEN) {
-    // Pridanie error callbacku pre logovanie chýb
     ws.send(JSON.stringify({ type, ...payload }), (err) => {
         if (err) console.error("⚠️ Send error:", err);
     });
@@ -50,22 +50,48 @@ function broadcastToRoom(roomId, except, type, payload = {}) {
   }
 }
 
-// 🔥 NOVÁ FUNKCIA: Odoslanie Push notifikácie cez Frappe
+// 🔥 OPRAVENÁ FUNKCIA: Používa natívne 'https' namiesto 'fetch'
 function sendPushNotification(toUser, fromUser, fromName, content, kind) {
     console.log(`📡 Sending Push to ${toUser} from ${fromUser}...`);
-    fetch(FRAPPE_NOTIFY_URL, {
+
+    const data = JSON.stringify({
+        "to_user": toUser,
+        "from_user": fromUser,
+        "from_name": fromName || "Niekto",
+        "content": kind === 'file' ? "📎 Poslal vám súbor" : content
+    });
+
+    const url = new URL(FRAPPE_NOTIFY_URL);
+    
+    const options = {
+        hostname: url.hostname,
+        path: url.pathname,
         method: 'POST',
-        headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, 
-        body: new URLSearchParams({
-          "to_user": toUser,
-          "from_user": fromUser,
-          "from_name": fromName || "Niekto",
-          "content": kind === 'file' ? "📎 Poslal vám súbor" : content
-        })
-      })
-      .then(res => res.json())
-      .then(json => console.log("✅ Frappe notify response:", json))
-      .catch(err => console.error("❌ Frappe notify failed:", err));
+        headers: {
+            'Content-Type': 'application/json',
+            'Content-Length': Buffer.byteLength(data)
+        }
+    };
+
+    const req = https.request(options, (res) => {
+        let responseBody = '';
+        res.on('data', (chunk) => { responseBody += chunk; });
+        res.on('end', () => {
+            if (res.statusCode >= 200 && res.statusCode < 300) {
+                console.log(`✅ Frappe notify Success (${res.statusCode}):`, responseBody);
+            } else {
+                console.error(`❌ Frappe notify Error (${res.statusCode}):`, responseBody);
+            }
+        });
+    });
+
+    req.on('error', (e) => {
+        console.error(`❌ Frappe Request Failed: ${e.message}`);
+    });
+
+    // Write data to request body
+    req.write(data);
+    req.end();
 }
 
 /* ============================================================================
@@ -140,15 +166,15 @@ const pendingCalls = new Map();     // roomId → { callId, callerName, fromUser
 wss.on("connection", (ws) => {
   const id = uuid();
   
-  // 🔥 HEARTBEAT: Inicializácia stavu
+  // 🔥 HEARTBEAT: Inicializácia
   ws.isAlive = true;
-  ws.on('pong', () => { ws.isAlive = true; }); // Keď príde PONG, klient žije
+  ws.on('pong', () => { ws.isAlive = true; });
 
   meta.set(ws, { id, roomId: null, username: null });
   console.log("🔌 Client connected:", id);
 
   ws.on("message", (raw) => {
-    // 🔥 HEARTBEAT: Každá správa potvrdzuje, že klient žije
+    // 🔥 HEARTBEAT: Klient žije
     ws.isAlive = true;
 
     let data;
@@ -168,9 +194,8 @@ wss.on("connection", (ws) => {
       if (!rooms.has(info.roomId)) rooms.set(info.roomId, new Set());
       rooms.get(info.roomId).add(ws);
 
-      // Register user globally for chat
+      // Register user globally
       const old = users.get(info.username);
-      // Ak je staré spojenie, skúsime ho ukončiť, aby sme nemali zombie
       if (old && old !== ws) {
           try { old.terminate(); } catch {}
       }
@@ -183,7 +208,7 @@ wss.on("connection", (ws) => {
         username: info.username
       });
 
-      // Ak v tejto roomke čaká hovor (Pending Call), pošli ho tomuto userovi!
+      // Pending Calls
       if (pendingCalls.has(info.roomId)) {
         const callInfo = pendingCalls.get(info.roomId);
         if (callInfo.fromUsername !== info.username) {
@@ -197,7 +222,7 @@ wss.on("connection", (ws) => {
         }
       }
 
-      // Doručenie offline správ (Chat)
+      // Offline Messages
       const queue = pendingMessages.get(info.username);
       if (queue) {
         console.log(`📦 Delivering ${queue.size} queued messages`);
@@ -265,7 +290,7 @@ wss.on("connection", (ws) => {
     }
 
     // ------------------------------------------------------------------------
-    // CHAT (🔥 OPRAVA NOTIFIKÁCIÍ)
+    // CHAT (🔥 OPRAVENÉ)
     // ------------------------------------------------------------------------
     if (type === "chat-message") {
       const { to, content, kind, filename, messageId } = data;
@@ -277,12 +302,11 @@ wss.on("connection", (ws) => {
       const recipient = users.get(to);
       let sentViaSocket = false;
 
-      // Pokúsime sa poslať cez socket
       if (recipient && recipient.readyState === recipient.OPEN) {
         try {
             recipient.send(JSON.stringify({ type: "chat-message", ...msg }), (err) => {
+                // Callback: zavolá sa, ak nastane chyba pri zápise do socketu
                 if (err) {
-                    // Ak nastane chyba pri odosielaní (napr. socket sa práve pretrhol)
                     console.log(`⚠️ Socket send failed for ${to}, falling back to Push.`);
                     sendPushNotification(to, username, info.username, content, kind);
                 }
@@ -294,12 +318,11 @@ wss.on("connection", (ws) => {
         }
       } 
       
-      // Ak sme neposlali cez socket (user nie je v mape alebo readyState != OPEN)
+      // Ak sme neposlali cez socket (alebo to zlyhalo synchrónne)
       if (!sentViaSocket) {
         sendPushNotification(to, username, info.username, content, kind);
       }
 
-      // Fronta pre neskoršie doručenie
       if (!pendingMessages.has(to)) pendingMessages.set(to, new Map());
       pendingMessages.get(to).set(messageId, msg);
       return;
@@ -344,7 +367,7 @@ wss.on("connection", (ws) => {
 });
 
 /* ============================================================================
-   🔥 HEARTBEAT (Ping/Pong) - Čistenie mŕtvych spojení
+   🔥 HEARTBEAT (Ping/Pong)
 ============================================================================ */
 const interval = setInterval(function ping() {
   wss.clients.forEach(function each(ws) {
@@ -356,7 +379,7 @@ const interval = setInterval(function ping() {
     ws.isAlive = false;
     ws.ping();
   });
-}, 30000); // Každých 30 sekúnd
+}, 30000); // 30 sekúnd
 
 wss.on('close', function close() {
   clearInterval(interval);
