@@ -33,7 +33,10 @@ function safeFilename(name) {
 
 function send(ws, type, payload = {}) {
   if (ws && ws.readyState === ws.OPEN) {
-    ws.send(JSON.stringify({ type, ...payload }));
+    // Pridanie error callbacku pre logovanie chýb
+    ws.send(JSON.stringify({ type, ...payload }), (err) => {
+        if (err) console.error("⚠️ Send error:", err);
+    });
   }
 }
 
@@ -45,6 +48,24 @@ function broadcastToRoom(roomId, except, type, payload = {}) {
       send(client, type, payload);
     }
   }
+}
+
+// 🔥 NOVÁ FUNKCIA: Odoslanie Push notifikácie cez Frappe
+function sendPushNotification(toUser, fromUser, fromName, content, kind) {
+    console.log(`📡 Sending Push to ${toUser} from ${fromUser}...`);
+    fetch(FRAPPE_NOTIFY_URL, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, 
+        body: new URLSearchParams({
+          "to_user": toUser,
+          "from_user": fromUser,
+          "from_name": fromName || "Niekto",
+          "content": kind === 'file' ? "📎 Poslal vám súbor" : content
+        })
+      })
+      .then(res => res.json())
+      .then(json => console.log("✅ Frappe notify response:", json))
+      .catch(err => console.error("❌ Frappe notify failed:", err));
 }
 
 /* ============================================================================
@@ -111,8 +132,6 @@ const rooms = new Map();            // roomId → Set(ws)
 const meta = new Map();             // ws → { id, roomId, username, callerName }
 const users = new Map();            // username → ws
 const pendingMessages = new Map();  // username → Map(messageId → message)
-
-// 🔥 OPRAVA: Pamäť pre čakajúce hovory (ak volajúci príde skôr ako volaný)
 const pendingCalls = new Map();     // roomId → { callId, callerName, fromUsername }
 
 /* ============================================================================
@@ -120,10 +139,18 @@ const pendingCalls = new Map();     // roomId → { callId, callerName, fromUser
 ============================================================================ */
 wss.on("connection", (ws) => {
   const id = uuid();
+  
+  // 🔥 HEARTBEAT: Inicializácia stavu
+  ws.isAlive = true;
+  ws.on('pong', () => { ws.isAlive = true; }); // Keď príde PONG, klient žije
+
   meta.set(ws, { id, roomId: null, username: null });
   console.log("🔌 Client connected:", id);
 
   ws.on("message", (raw) => {
+    // 🔥 HEARTBEAT: Každá správa potvrdzuje, že klient žije
+    ws.isAlive = true;
+
     let data;
     try { data = JSON.parse(raw.toString()); }
     catch { return; }
@@ -143,7 +170,10 @@ wss.on("connection", (ws) => {
 
       // Register user globally for chat
       const old = users.get(info.username);
-      if (old && old !== ws) try { old.close(); } catch {}
+      // Ak je staré spojenie, skúsime ho ukončiť, aby sme nemali zombie
+      if (old && old !== ws) {
+          try { old.terminate(); } catch {}
+      }
       users.set(info.username, ws);
 
       console.log(`👥 ${info.username} joined ${info.roomId}`);
@@ -153,10 +183,9 @@ wss.on("connection", (ws) => {
         username: info.username
       });
 
-      // 🔥 OPRAVA: Ak v tejto roomke čaká hovor (Pending Call), pošli ho tomuto userovi!
+      // Ak v tejto roomke čaká hovor (Pending Call), pošli ho tomuto userovi!
       if (pendingCalls.has(info.roomId)) {
         const callInfo = pendingCalls.get(info.roomId);
-        // Neposielať späť volajúcemu, iba novému účastníkovi
         if (callInfo.fromUsername !== info.username) {
             console.log(`🚀 Sending pending call in ${info.roomId} to late joiner ${info.username}`);
             send(ws, "incoming-call", {
@@ -187,19 +216,15 @@ wss.on("connection", (ws) => {
     // ------------------------------------------------------------------------
     if (type === "call") {
       info.callerName = data.callerName || username;
-
-      // Zisti, či je v miestnosti niekto iný
       const peers = rooms.get(roomId);
       const otherPeers = [...peers].filter(p => p !== ws);
 
-      // Ulož hovor do "čakárne", ak by sa volaný pripojil neskôr
       pendingCalls.set(roomId, {
           callId: data.callId,
           callerName: info.callerName,
           fromUsername: username
       });
 
-      // Ak je už niekto v miestnosti, pošli mu to hneď
       if (otherPeers.length > 0) {
           broadcastToRoom(roomId, ws, "incoming-call", {
             from: username,
@@ -214,9 +239,7 @@ wss.on("connection", (ws) => {
     }
 
     if (type === "accept") {
-      // Keď je hovor prijatý, vymažeme ho z čakárne
       pendingCalls.delete(roomId);
-
       broadcastToRoom(roomId, ws, "call-accepted", {
         from: username,
         callId: data.callId
@@ -226,7 +249,6 @@ wss.on("connection", (ws) => {
 
     if (type === "reject" || type === "hangup") {
       pendingCalls.delete(roomId);
-      
       broadcastToRoom(roomId, ws, "call-ended", {
         from: username,
         callId: data.callId
@@ -238,15 +260,12 @@ wss.on("connection", (ws) => {
     // WEBRTC SIGNALING
     // ------------------------------------------------------------------------
     if (["offer", "answer", "candidate"].includes(type)) {
-      broadcastToRoom(roomId, ws, type, {
-        from: username,
-        ...data
-      });
+      broadcastToRoom(roomId, ws, type, { from: username, ...data });
       return;
     }
 
     // ------------------------------------------------------------------------
-    // CHAT
+    // CHAT (🔥 OPRAVA NOTIFIKÁCIÍ)
     // ------------------------------------------------------------------------
     if (type === "chat-message") {
       const { to, content, kind, filename, messageId } = data;
@@ -256,33 +275,31 @@ wss.on("connection", (ws) => {
       };
 
       const recipient = users.get(to);
+      let sentViaSocket = false;
 
-      // --- LOGIKA PRE PUSH ---
+      // Pokúsime sa poslať cez socket
       if (recipient && recipient.readyState === recipient.OPEN) {
-        // Používateľ je online, doručíme správu cez WebSocket
-        send(recipient, "chat-message", msg);
-      } else {
-        // Používateľ je OFFLINE -> zavoláme Frappe, aby poslal Push
-        console.log(`📡 User ${to} is offline. Triggering APNs via Frappe...`);
-        
-        fetch(FRAPPE_NOTIFY_URL, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, 
-          // Frappe whitelist endpointy majú radi form-data alebo urlencoded
-          body: new URLSearchParams({
-            "to_user": to,
-            "from_user": username,
-            "from_name": info.username || "Niekto", // 'info' je meta dáta odosielateľa
-            "content": kind === 'file' ? "📎 Poslal vám súbor" : content
-          })
-        })
-        .then(res => res.json())
-        .then(json => console.log("✅ Frappe notify response:", json))
-        .catch(err => console.error("❌ Frappe notify failed:", err));
+        try {
+            recipient.send(JSON.stringify({ type: "chat-message", ...msg }), (err) => {
+                if (err) {
+                    // Ak nastane chyba pri odosielaní (napr. socket sa práve pretrhol)
+                    console.log(`⚠️ Socket send failed for ${to}, falling back to Push.`);
+                    sendPushNotification(to, username, info.username, content, kind);
+                }
+            });
+            sentViaSocket = true;
+        } catch (e) {
+            console.error("Socket error sync:", e);
+            sentViaSocket = false;
+        }
+      } 
+      
+      // Ak sme neposlali cez socket (user nie je v mape alebo readyState != OPEN)
+      if (!sentViaSocket) {
+        sendPushNotification(to, username, info.username, content, kind);
       }
-      // --- KONIEC LOGIKY PRE PUSH ---
 
-      // Tvoja pôvodná fronta správ pre neskoršie doručenie
+      // Fronta pre neskoršie doručenie
       if (!pendingMessages.has(to)) pendingMessages.set(to, new Map());
       pendingMessages.get(to).set(messageId, msg);
       return;
@@ -300,7 +317,6 @@ wss.on("connection", (ws) => {
       broadcastToRoom(roomId, ws, "peer-left", { peerId: username });
       rooms.get(roomId)?.delete(ws);
       users.delete(username);
-      // Ak odíde volajúci, zruš pending call
       const pending = pendingCalls.get(roomId);
       if (pending && pending.fromUsername === username) {
           pendingCalls.delete(roomId);
@@ -316,7 +332,6 @@ wss.on("connection", (ws) => {
       });
       rooms.get(info.roomId)?.delete(ws);
       
-      // Cleanup pending calls if the caller disconnects
       const pending = pendingCalls.get(info.roomId);
       if (pending && pending.fromUsername === info.username) {
           pendingCalls.delete(info.roomId);
@@ -326,6 +341,25 @@ wss.on("connection", (ws) => {
     meta.delete(ws);
     console.log("❌ Client disconnected:", id);
   });
+});
+
+/* ============================================================================
+   🔥 HEARTBEAT (Ping/Pong) - Čistenie mŕtvych spojení
+============================================================================ */
+const interval = setInterval(function ping() {
+  wss.clients.forEach(function each(ws) {
+    if (ws.isAlive === false) {
+       console.log("💀 Terminating inactive client");
+       return ws.terminate();
+    }
+    
+    ws.isAlive = false;
+    ws.ping();
+  });
+}, 30000); // Každých 30 sekúnd
+
+wss.on('close', function close() {
+  clearInterval(interval);
 });
 
 /* ============================================================================
