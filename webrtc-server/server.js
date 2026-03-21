@@ -1,6 +1,6 @@
 import { WebSocketServer } from "ws";
 import { createServer } from "http";
-import https from "https"; // 🔥 PRIDANÉ: Import pre natívne HTTPS
+import https from "https";
 import { v4 as uuid } from "uuid";
 import {
   S3Client,
@@ -50,7 +50,6 @@ function broadcastToRoom(roomId, except, type, payload = {}) {
   }
 }
 
-// 🔥 OPRAVENÁ FUNKCIA: Používa natívne 'https' namiesto 'fetch'
 function sendPushNotification(toUser, fromUser, fromName, content, kind) {
     console.log(`📡 Sending Push to ${toUser} from ${fromUser}...`);
 
@@ -89,7 +88,6 @@ function sendPushNotification(toUser, fromUser, fromName, content, kind) {
         console.error(`❌ Frappe Request Failed: ${e.message}`);
     });
 
-    // Write data to request body
     req.write(data);
     req.end();
 }
@@ -154,11 +152,11 @@ const wss = new WebSocketServer({ server, path: "/ws" });
 /* ============================================================================
    STATE
 ============================================================================ */
-const rooms = new Map();            // roomId → Set(ws)
-const meta = new Map();             // ws → { id, roomId, username, callerName }
-const users = new Map();            // username → ws
-const pendingMessages = new Map();  // username → Map(messageId → message)
-const pendingCalls = new Map();     // roomId → { callId, callerName, fromUsername }
+const rooms = new Map();
+const meta = new Map();
+const users = new Map();
+const pendingMessages = new Map();
+const pendingCalls = new Map();
 
 /* ============================================================================
    WS CONNECTION
@@ -166,7 +164,6 @@ const pendingCalls = new Map();     // roomId → { callId, callerName, fromUser
 wss.on("connection", (ws) => {
   const id = uuid();
   
-  // 🔥 HEARTBEAT: Inicializácia
   ws.isAlive = true;
   ws.on('pong', () => { ws.isAlive = true; });
 
@@ -174,7 +171,6 @@ wss.on("connection", (ws) => {
   console.log("🔌 Client connected:", id);
 
   ws.on("message", (raw) => {
-    // 🔥 HEARTBEAT: Klient žije
     ws.isAlive = true;
 
     let data;
@@ -194,7 +190,6 @@ wss.on("connection", (ws) => {
       if (!rooms.has(info.roomId)) rooms.set(info.roomId, new Set());
       rooms.get(info.roomId).add(ws);
 
-      // Register user globally
       const old = users.get(info.username);
       if (old && old !== ws) {
           try { old.terminate(); } catch {}
@@ -208,7 +203,6 @@ wss.on("connection", (ws) => {
         username: info.username
       });
 
-      // Pending Calls
       if (pendingCalls.has(info.roomId)) {
         const callInfo = pendingCalls.get(info.roomId);
         if (callInfo.fromUsername !== info.username) {
@@ -222,7 +216,6 @@ wss.on("connection", (ws) => {
         }
       }
 
-      // Offline Messages
       const queue = pendingMessages.get(info.username);
       if (queue) {
         console.log(`📦 Delivering ${queue.size} queued messages`);
@@ -290,7 +283,7 @@ wss.on("connection", (ws) => {
     }
 
     // ------------------------------------------------------------------------
-    // CHAT (🔥 OPRAVENÉ)
+    // CHAT MESSAGE
     // ------------------------------------------------------------------------
     if (type === "chat-message") {
       const { to, content, kind, filename, messageId } = data;
@@ -305,7 +298,6 @@ wss.on("connection", (ws) => {
       if (recipient && recipient.readyState === recipient.OPEN) {
         try {
             recipient.send(JSON.stringify({ type: "chat-message", ...msg }), (err) => {
-                // Callback: zavolá sa, ak nastane chyba pri zápise do socketu
                 if (err) {
                     console.log(`⚠️ Socket send failed for ${to}, falling back to Push.`);
                     sendPushNotification(to, username, info.username, content, kind);
@@ -318,7 +310,6 @@ wss.on("connection", (ws) => {
         }
       } 
       
-      // Ak sme neposlali cez socket (alebo to zlyhalo synchrónne)
       if (!sentViaSocket) {
         sendPushNotification(to, username, info.username, content, kind);
       }
@@ -328,6 +319,97 @@ wss.on("connection", (ws) => {
       return;
     }
 
+    // ------------------------------------------------------------------------
+    // ✅ CHAT EDIT - Úprava správy
+    // ------------------------------------------------------------------------
+    if (type === "chat-edit") {
+      const { to, messageId, content } = data;
+      
+      console.log(`✏️ Chat edit: from=${username}, to=${to}, messageId=${messageId}`);
+      
+      const recipient = users.get(to);
+      if (recipient && recipient.readyState === recipient.OPEN) {
+        try {
+          recipient.send(JSON.stringify({
+            type: "chat-edit",
+            from: username,
+            to: to,
+            messageId: messageId,
+            content: content
+          }));
+          console.log(`✅ Edit forwarded to ${to}`);
+        } catch (e) {
+          console.error(`❌ Failed to send edit to ${to}:`, e);
+        }
+      } else {
+        console.log(`⚠️ Recipient ${to} not online, edit not delivered`);
+      }
+      return;
+    }
+
+    // ------------------------------------------------------------------------
+    // ✅ CHAT DELETE - Vymazanie správy
+    // ------------------------------------------------------------------------
+    if (type === "chat-delete") {
+      const { to, messageId } = data;
+      
+      console.log(`🗑️ Chat delete: from=${username}, to=${to}, messageId=${messageId}`);
+      
+      const recipient = users.get(to);
+      if (recipient && recipient.readyState === recipient.OPEN) {
+        try {
+          recipient.send(JSON.stringify({
+            type: "chat-delete",
+            from: username,
+            to: to,
+            messageId: messageId
+          }));
+          console.log(`✅ Delete forwarded to ${to}`);
+        } catch (e) {
+          console.error(`❌ Failed to send delete to ${to}:`, e);
+        }
+      } else {
+        console.log(`⚠️ Recipient ${to} not online, delete not delivered`);
+      }
+      return;
+    }
+
+    // ------------------------------------------------------------------------
+    // ✅ CHAT REACTION - Reakcia na správu
+    // ------------------------------------------------------------------------
+    if (type === "chat-reaction") {
+      const { to, messageId, emoji } = data;
+      
+      console.log(`❤️ Chat reaction: from=${username}, to=${to}, messageId=${messageId}, emoji=${emoji || 'removed'}`);
+      
+      const recipient = users.get(to);
+      if (recipient && recipient.readyState === recipient.OPEN) {
+        try {
+          const payload = {
+            type: "chat-reaction",
+            from: username,
+            to: to,
+            messageId: messageId
+          };
+          
+          if (emoji) {
+            payload.emoji = emoji;
+          }
+          
+          recipient.send(JSON.stringify(payload));
+          console.log(`✅ Reaction forwarded to ${to}`);
+        } catch (e) {
+          console.error(`❌ Failed to send reaction to ${to}:`, e);
+        }
+      } else {
+        console.log(`⚠️ Recipient ${to} not online, reaction not delivered`);
+      }
+      return;
+    }
+
+    // ------------------------------------------------------------------------
+    // CHAT ACK
+    // ------------------------------------------------------------------------
     if (type === "chat-ack") {
       const queue = pendingMessages.get(username);
       if (queue?.delete(data.messageId)) {
@@ -336,6 +418,9 @@ wss.on("connection", (ws) => {
       return;
     }
 
+    // ------------------------------------------------------------------------
+    // LEAVE
+    // ------------------------------------------------------------------------
     if (type === "leave") {
       broadcastToRoom(roomId, ws, "peer-left", { peerId: username });
       rooms.get(roomId)?.delete(ws);
@@ -367,7 +452,7 @@ wss.on("connection", (ws) => {
 });
 
 /* ============================================================================
-   🔥 HEARTBEAT (Ping/Pong)
+   HEARTBEAT (Ping/Pong)
 ============================================================================ */
 const interval = setInterval(function ping() {
   wss.clients.forEach(function each(ws) {
@@ -379,7 +464,7 @@ const interval = setInterval(function ping() {
     ws.isAlive = false;
     ws.ping();
   });
-}, 30000); // 30 sekúnd
+}, 30000);
 
 wss.on('close', function close() {
   clearInterval(interval);
