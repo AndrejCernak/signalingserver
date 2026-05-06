@@ -1,6 +1,6 @@
 import { WebSocketServer } from "ws";
 import { createServer } from "http";
-import https from "https";
+import https from "https"; // 🔥 PRIDANÉ: Import pre natívne HTTPS
 import { v4 as uuid } from "uuid";
 import {
   S3Client,
@@ -50,6 +50,7 @@ function broadcastToRoom(roomId, except, type, payload = {}) {
   }
 }
 
+// 🔥 OPRAVENÁ FUNKCIA: Používa natívne 'https' namiesto 'fetch'
 function sendPushNotification(toUser, fromUser, fromName, content, kind) {
     console.log(`📡 Sending Push to ${toUser} from ${fromUser}...`);
 
@@ -88,6 +89,7 @@ function sendPushNotification(toUser, fromUser, fromName, content, kind) {
         console.error(`❌ Frappe Request Failed: ${e.message}`);
     });
 
+    // Write data to request body
     req.write(data);
     req.end();
 }
@@ -152,11 +154,11 @@ const wss = new WebSocketServer({ server, path: "/ws" });
 /* ============================================================================
    STATE
 ============================================================================ */
-const rooms = new Map();
-const meta = new Map();
-const users = new Map();
-const pendingMessages = new Map();
-const pendingCalls = new Map();
+const rooms = new Map();            // roomId → Set(ws)
+const meta = new Map();             // ws → { id, roomId, username, callerName }
+const users = new Map();            // username → ws
+const pendingMessages = new Map();  // username → Map(messageId → message)
+const pendingCalls = new Map();     // roomId → { callId, callerName, fromUsername }
 
 /* ============================================================================
    WS CONNECTION
@@ -164,6 +166,7 @@ const pendingCalls = new Map();
 wss.on("connection", (ws) => {
   const id = uuid();
   
+  // 🔥 HEARTBEAT: Inicializácia
   ws.isAlive = true;
   ws.on('pong', () => { ws.isAlive = true; });
 
@@ -171,6 +174,7 @@ wss.on("connection", (ws) => {
   console.log("🔌 Client connected:", id);
 
   ws.on("message", (raw) => {
+    // 🔥 HEARTBEAT: Klient žije
     ws.isAlive = true;
 
     let data;
@@ -190,6 +194,7 @@ wss.on("connection", (ws) => {
       if (!rooms.has(info.roomId)) rooms.set(info.roomId, new Set());
       rooms.get(info.roomId).add(ws);
 
+      // Register user globally
       const old = users.get(info.username);
       if (old && old !== ws) {
           try { old.terminate(); } catch {}
@@ -198,11 +203,18 @@ wss.on("connection", (ws) => {
 
       console.log(`👥 ${info.username} joined ${info.roomId}`);
 
+      // 🔥 CRITICAL FIX: Send joined ACK to the client!
+      send(ws, "joined", {
+        roomId: info.roomId,
+        username: info.username
+      });
+
       broadcastToRoom(info.roomId, ws, "peer-joined", {
         peerId: info.username,
         username: info.username
       });
 
+      // Pending Calls
       if (pendingCalls.has(info.roomId)) {
         const callInfo = pendingCalls.get(info.roomId);
         if (callInfo.fromUsername !== info.username) {
@@ -216,6 +228,7 @@ wss.on("connection", (ws) => {
         }
       }
 
+      // Offline Messages
       const queue = pendingMessages.get(info.username);
       if (queue) {
         console.log(`📦 Delivering ${queue.size} queued messages`);
@@ -283,7 +296,7 @@ wss.on("connection", (ws) => {
     }
 
     // ------------------------------------------------------------------------
-    // CHAT MESSAGE
+    // CHAT (🔥 OPRAVENÉ)
     // ------------------------------------------------------------------------
     if (type === "chat-message") {
       const { to, content, kind, filename, messageId } = data;
@@ -298,6 +311,7 @@ wss.on("connection", (ws) => {
       if (recipient && recipient.readyState === recipient.OPEN) {
         try {
             recipient.send(JSON.stringify({ type: "chat-message", ...msg }), (err) => {
+                // Callback: zavolá sa, ak nastane chyba pri zápise do socketu
                 if (err) {
                     console.log(`⚠️ Socket send failed for ${to}, falling back to Push.`);
                     sendPushNotification(to, username, info.username, content, kind);
@@ -310,6 +324,7 @@ wss.on("connection", (ws) => {
         }
       } 
       
+      // Ak sme neposlali cez socket (alebo to zlyhalo synchrónne)
       if (!sentViaSocket) {
         sendPushNotification(to, username, info.username, content, kind);
       }
@@ -320,7 +335,7 @@ wss.on("connection", (ws) => {
     }
 
     // ------------------------------------------------------------------------
-    // ✅ CHAT EDIT - Úprava správy
+    // ✅ NEW: CHAT EDIT (Úprava správy)
     // ------------------------------------------------------------------------
     if (type === "chat-edit") {
       const { to, messageId, content } = data;
@@ -348,7 +363,7 @@ wss.on("connection", (ws) => {
     }
 
     // ------------------------------------------------------------------------
-    // ✅ CHAT DELETE - Vymazanie správy
+    // ✅ NEW: CHAT DELETE (Vymazanie správy)
     // ------------------------------------------------------------------------
     if (type === "chat-delete") {
       const { to, messageId } = data;
@@ -375,7 +390,7 @@ wss.on("connection", (ws) => {
     }
 
     // ------------------------------------------------------------------------
-    // ✅ CHAT REACTION - Reakcia na správu
+    // ✅ NEW: CHAT REACTION (Reakcia na správu)
     // ------------------------------------------------------------------------
     if (type === "chat-reaction") {
       const { to, messageId, emoji } = data;
@@ -392,6 +407,7 @@ wss.on("connection", (ws) => {
             messageId: messageId
           };
           
+          // Emoji môže byť undefined pri odstránení reakcie
           if (emoji) {
             payload.emoji = emoji;
           }
@@ -407,9 +423,6 @@ wss.on("connection", (ws) => {
       return;
     }
 
-    // ------------------------------------------------------------------------
-    // CHAT ACK
-    // ------------------------------------------------------------------------
     if (type === "chat-ack") {
       const queue = pendingMessages.get(username);
       if (queue?.delete(data.messageId)) {
@@ -418,9 +431,6 @@ wss.on("connection", (ws) => {
       return;
     }
 
-    // ------------------------------------------------------------------------
-    // LEAVE
-    // ------------------------------------------------------------------------
     if (type === "leave") {
       broadcastToRoom(roomId, ws, "peer-left", { peerId: username });
       rooms.get(roomId)?.delete(ws);
@@ -452,7 +462,7 @@ wss.on("connection", (ws) => {
 });
 
 /* ============================================================================
-   HEARTBEAT (Ping/Pong)
+   🔥 HEARTBEAT (Ping/Pong)
 ============================================================================ */
 const interval = setInterval(function ping() {
   wss.clients.forEach(function each(ws) {
@@ -464,7 +474,7 @@ const interval = setInterval(function ping() {
     ws.isAlive = false;
     ws.ping();
   });
-}, 30000);
+}, 30000); // 30 sekúnd
 
 wss.on('close', function close() {
   clearInterval(interval);
