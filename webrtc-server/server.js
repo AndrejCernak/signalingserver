@@ -119,7 +119,7 @@ const server = createServer((req, res) => {
     return;
   }
 
-  // 🔥 NEW: Health check endpoint pre keep-alive ping z externého servisu
+  // Health check endpoint pre keep-alive ping z externého servisu
   if (req.method === "GET" && req.url === "/health") {
     res.writeHead(200, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({ status: "ok", time: new Date().toISOString() }));
@@ -136,6 +136,8 @@ const meta = new Map();
 const users = new Map();
 const pendingMessages = new Map();
 const pendingCalls = new Map();
+// 🔥 NEW: queue pre accept signály ak caller ešte nie je v roomu keď callee accepts
+const pendingAccepts = new Map();
 
 wss.on("connection", (ws) => {
   const id = uuid();
@@ -156,7 +158,7 @@ wss.on("connection", (ws) => {
     const { type } = data;
     const info = meta.get(ws);
 
-    // 🔥 NEW: Application-level ping/pong handler
+    // Application-level ping/pong handler
     if (type === "ping") {
       send(ws, "pong", { timestamp: data.timestamp });
       return;
@@ -196,6 +198,19 @@ wss.on("connection", (ws) => {
         }
       }
 
+      // 🔥 NEW: Replay queued accept ak existuje (caller pripojil neskôr ako accept prišiel)
+      if (pendingAccepts.has(info.roomId)) {
+        const accept = pendingAccepts.get(info.roomId);
+        if (accept.fromUsername !== info.username) {
+          console.log(`📤 Replaying queued accept for room=${info.roomId} to ${info.username}`);
+          send(ws, "call-accepted", {
+            from: accept.fromUsername,
+            callId: accept.callId
+          });
+          pendingAccepts.delete(info.roomId);
+        }
+      }
+
       const queue = pendingMessages.get(info.username);
       if (queue) {
         for (const msg of queue.values()) {
@@ -230,17 +245,43 @@ wss.on("connection", (ws) => {
       return;
     }
 
+    // 🔥 NEW: Robust accept handler — queue ak caller v roomu nie je
     if (type === "accept") {
       pendingCalls.delete(roomId);
-      broadcastToRoom(roomId, ws, "call-accepted", {
-        from: username,
-        callId: data.callId
-      });
+
+      const peers = rooms.get(roomId);
+      const otherPeers = peers ? [...peers].filter(p => p !== ws) : [];
+
+      if (otherPeers.length > 0) {
+        broadcastToRoom(roomId, ws, "call-accepted", {
+          from: username,
+          callId: data.callId
+        });
+        console.log(`✅ Accept delivered for room=${roomId}`);
+      } else {
+        console.log(`📥 Queueing accept for room=${roomId} (caller not present)`);
+        pendingAccepts.set(roomId, {
+          callId: data.callId,
+          fromUsername: username,
+          timestamp: Date.now()
+        });
+
+        // Auto-cleanup po 30s
+        const ts = Date.now();
+        setTimeout(() => {
+          const stored = pendingAccepts.get(roomId);
+          if (stored && stored.timestamp === ts) {
+            pendingAccepts.delete(roomId);
+            console.log(`🗑️ Expired queued accept for room=${roomId}`);
+          }
+        }, 30000);
+      }
       return;
     }
 
     if (type === "reject" || type === "hangup") {
       pendingCalls.delete(roomId);
+      pendingAccepts.delete(roomId); // 🔥 NEW: cleanup pending accept on hangup
       broadcastToRoom(roomId, ws, "call-ended", {
         from: username,
         callId: data.callId
@@ -334,6 +375,11 @@ wss.on("connection", (ws) => {
       if (pending && pending.fromUsername === username) {
         pendingCalls.delete(roomId);
       }
+      // 🔥 NEW: cleanup queued accept
+      const pendingA = pendingAccepts.get(roomId);
+      if (pendingA && pendingA.fromUsername === username) {
+        pendingAccepts.delete(roomId);
+      }
     }
   });
 
@@ -345,6 +391,11 @@ wss.on("connection", (ws) => {
       const pending = pendingCalls.get(info.roomId);
       if (pending && pending.fromUsername === info.username) {
         pendingCalls.delete(info.roomId);
+      }
+      // 🔥 NEW: cleanup queued accept
+      const pendingA = pendingAccepts.get(info.roomId);
+      if (pendingA && pendingA.fromUsername === info.username) {
+        pendingAccepts.delete(info.roomId);
       }
     }
     users.delete(info?.username);
