@@ -139,6 +139,10 @@ const pendingCalls = new Map();
 // 🔥 NEW: queue pre accept signály ak caller ešte nie je v roomu keď callee accepts
 const pendingAccepts = new Map();
 
+// Limity offline fronty (ochrana proti rastu pamäte ak príjemca nikdy nepošle chat-ack)
+const MAX_QUEUED_PER_USER = 200;          // max počet nedoručených správ na používateľa
+const MESSAGE_TTL_MS = 7 * 24 * 60 * 60 * 1000;  // 7 dní
+
 wss.on("connection", (ws) => {
   const id = uuid();
 
@@ -320,7 +324,12 @@ wss.on("connection", (ws) => {
       }
 
       if (!pendingMessages.has(to)) pendingMessages.set(to, new Map());
-      pendingMessages.get(to).set(messageId, msg);
+      const queue = pendingMessages.get(to);
+      queue.set(messageId, msg);
+      // Strop: ak fronta prerastie limit, zahoď najstaršiu správu (Map drží poradie vloženia)
+      while (queue.size > MAX_QUEUED_PER_USER) {
+        queue.delete(queue.keys().next().value);
+      }
       return;
     }
 
@@ -412,8 +421,22 @@ const interval = setInterval(function ping() {
   });
 }, 30000);
 
+// Pravidelné čistenie offline fronty od správ starších ako TTL
+const cleanupInterval = setInterval(function cleanupPending() {
+  const now = Date.now();
+  for (const [user, queue] of pendingMessages) {
+    for (const [messageId, msg] of queue) {
+      if (now - new Date(msg.timestamp).getTime() > MESSAGE_TTL_MS) {
+        queue.delete(messageId);
+      }
+    }
+    if (queue.size === 0) pendingMessages.delete(user);
+  }
+}, 60 * 60 * 1000); // raz za hodinu
+
 wss.on('close', function close() {
   clearInterval(interval);
+  clearInterval(cleanupInterval);
 });
 
 const PORT = process.env.PORT || 10000;
