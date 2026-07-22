@@ -379,7 +379,9 @@ wss.on("connection", (ws) => {
     if (type === "leave") {
       broadcastToRoom(roomId, ws, "peer-left", { peerId: username });
       rooms.get(roomId)?.delete(ws);
-      users.delete(username);
+      // Zmaž mapping len ak patrí TOMUTO socketu (inak by leave starého socketu
+      // zmazal mapping nového po re-joine)
+      if (users.get(username) === ws) users.delete(username);
       const pending = pendingCalls.get(roomId);
       if (pending && pending.fromUsername === username) {
         pendingCalls.delete(roomId);
@@ -407,7 +409,12 @@ wss.on("connection", (ws) => {
         pendingAccepts.delete(info.roomId);
       }
     }
-    users.delete(info?.username);
+    // Zmaž mapping len ak stále ukazuje na TENTO socket — pri re-joine je starý
+    // socket terminated a jeho close by inak zmazal mapping NOVÉHO socketu,
+    // čím by sa rozbilo doručovanie chatu až do ďalšieho joinu.
+    if (info?.username && users.get(info.username) === ws) {
+      users.delete(info.username);
+    }
     meta.delete(ws);
     console.log("❌ Client disconnected:", id);
   });
