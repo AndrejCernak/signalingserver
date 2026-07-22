@@ -306,22 +306,19 @@ wss.on("connection", (ws) => {
       };
 
       const recipient = users.get(to);
-      let sentViaSocket = false;
 
+      // Doruč cez socket ak je príjemca pripojený (živý chat vo popredí).
       if (recipient && recipient.readyState === recipient.OPEN) {
         try {
-          recipient.send(JSON.stringify({ type: "chat-message", ...msg }), (err) => {
-            if (err) sendPushNotification(to, username, info.username, content, kind);
-          });
-          sentViaSocket = true;
-        } catch (e) {
-          sentViaSocket = false;
-        }
+          recipient.send(JSON.stringify({ type: "chat-message", ...msg }));
+        } catch (e) {}
       }
 
-      if (!sentViaSocket) {
-        sendPushNotification(to, username, info.username, content, kind);
-      }
+      // Push posielame VŽDY. iOS appka si banner potlačí sama, ak má práve
+      // ten chat otvorený (willPresent). Dôvod: suspendovaná appka drží socket
+      // "OPEN" ešte ~30s (heartbeat interval), takže by inak vyzerala online
+      // a push by neprišiel → chýbajúce notifikácie. Vždy-push to spoľahlivo rieši.
+      sendPushNotification(to, username, info.username, content, kind);
 
       if (!pendingMessages.has(to)) pendingMessages.set(to, new Map());
       const queue = pendingMessages.get(to);
