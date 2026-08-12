@@ -17,7 +17,12 @@ const s3 = new S3Client({
   }
 });
 
-const FRAPPE_NOTIFY_URL = "https://bcservices.f.frappe.cloud/api/method/bcservices.api.notify.send_notification";
+// Poradie backendov: najprv produkcia, potom dev. Ak prod vráti "User not found"
+// (testovacie účty existujú len na dev site), notifikácia sa skúsi na ďalšom.
+const FRAPPE_NOTIFY_URLS = [
+  "https://bcservices.f.frappe.cloud/api/method/bcservices.api.notify.send_notification",
+  "https://dev1.babylogroup.com/api/method/bcservices.api.notify.send_notification"
+];
 
 function safeFilename(name) {
   return name.normalize("NFD").replace(/[\u0300-\u036f]/g, "").replace(/[^a-zA-Z0-9._-]/g, "_");
@@ -41,7 +46,8 @@ function broadcastToRoom(roomId, except, type, payload = {}) {
   }
 }
 
-function sendPushNotification(toUser, fromUser, fromName, content, kind) {
+function sendPushNotification(toUser, fromUser, fromName, content, kind, urlIndex = 0) {
+  if (urlIndex >= FRAPPE_NOTIFY_URLS.length) return;
   const data = JSON.stringify({
     "to_user": toUser,
     "from_user": fromUser,
@@ -49,7 +55,7 @@ function sendPushNotification(toUser, fromUser, fromName, content, kind) {
     "content": kind === 'file' ? "📎 Poslal vám súbor" : content
   });
 
-  const url = new URL(FRAPPE_NOTIFY_URL);
+  const url = new URL(FRAPPE_NOTIFY_URLS[urlIndex]);
   const options = {
     hostname: url.hostname,
     path: url.pathname,
@@ -64,10 +70,14 @@ function sendPushNotification(toUser, fromUser, fromName, content, kind) {
     let responseBody = '';
     res.on('data', (chunk) => { responseBody += chunk; });
     res.on('end', () => {
-      if (res.statusCode >= 200 && res.statusCode < 300) {
-        console.log(`✅ Frappe notify Success (${res.statusCode})`);
+      const userNotFound = responseBody.includes("User not found");
+      if (res.statusCode >= 200 && res.statusCode < 300 && !userNotFound) {
+        console.log(`OK Frappe notify Success (${res.statusCode}) via ${url.hostname}`);
+      } else if (userNotFound) {
+        console.log(`.. ${url.hostname}: user ${toUser} not found, trying next backend`);
+        sendPushNotification(toUser, fromUser, fromName, content, kind, urlIndex + 1);
       } else {
-        console.error(`❌ Frappe notify Error (${res.statusCode}):`, responseBody);
+        console.error(`ERR Frappe notify Error (${res.statusCode}) via ${url.hostname}:`, responseBody);
       }
     });
   });
