@@ -360,6 +360,13 @@ wss.on("connection", (ws) => {
       return;
     }
 
+    // Konferencny stav ucastnika (meno, mute) - kazdy ho broadcastne miestnosti
+    // po pripojeni a pri kazdej zmene, aby ostatni vedeli koho poculi a ci ma mute.
+    if (type === "conf-state") {
+      broadcastToRoom(roomId, ws, "conf-state", { from: username, ...data });
+      return;
+    }
+
     // Prizvany uz niekde telefonuje - odpoved ide priamo prizyvajucemu,
     // ten NIE JE v miestnosti hovoru prijemcu, preto routujeme globalne.
     if (type === "busy") {
