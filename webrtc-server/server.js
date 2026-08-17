@@ -87,6 +87,26 @@ function sendPushNotification(toUser, fromUser, fromName, content, kind, urlInde
   req.end();
 }
 
+function roomPeerCount(roomId) {
+  return rooms.get(roomId)?.size || 0;
+}
+
+/**
+ * Odchod ucastnika z hovorovej miestnosti.
+ * Konferencia: ostatni len odstrania jeho spojenie (peer-left) a hovor bezi dalej.
+ * Ked ostane uz len jeden clovek, hovor realne skoncil -> posleme aj call-ended
+ * (drzi spravanie 1:1 hovorov a starsich verzii appky).
+ */
+function handlePeerLeave(ws, roomId, username) {
+  if (!roomId) return;
+  broadcastToRoom(roomId, ws, "peer-left", { peerId: username });
+  rooms.get(roomId)?.delete(ws);
+  if (roomPeerCount(roomId) === 1) {
+    broadcastToRoom(roomId, ws, "call-ended", { from: username });
+  }
+  if (roomPeerCount(roomId) === 0) rooms.delete(roomId);
+}
+
 const server = createServer((req, res) => {
   if (req.method === "POST" && req.url === "/upload-url") {
     let body = "";
@@ -149,6 +169,9 @@ const pendingCalls = new Map();
 // 🔥 NEW: queue pre accept signály ak caller ešte nie je v roomu keď callee accepts
 const pendingAccepts = new Map();
 
+// Max pocet ucastnikov v jednej hovorovej miestnosti (konferencia: ja + 4).
+const MAX_ROOM_PEERS = 5;
+
 // Limity offline fronty (ochrana proti rastu pamäte ak príjemca nikdy nepošle chat-ack)
 const MAX_QUEUED_PER_USER = 200;          // max počet nedoručených správ na používateľa
 const MESSAGE_TTL_MS = 7 * 24 * 60 * 60 * 1000;  // 7 dní
@@ -183,6 +206,17 @@ wss.on("connection", (ws) => {
       info.username = data.username;
 
       if (!rooms.has(info.roomId)) rooms.set(info.roomId, new Set());
+
+      // Konferencia: strop poctu ucastnikov. Re-join toho isteho pouzivatela
+      // sa nepocita (stary socket sa o chvilu zavrie).
+      const existing = [...rooms.get(info.roomId)]
+        .filter(p => meta.get(p)?.username && meta.get(p).username !== info.username);
+      if (existing.length >= MAX_ROOM_PEERS) {
+        console.log("Room " + info.roomId + " full - rejecting " + info.username);
+        send(ws, "room-full", { roomId: info.roomId, max: MAX_ROOM_PEERS });
+        return;
+      }
+
       rooms.get(info.roomId).add(ws);
 
       const old = users.get(info.username);
@@ -191,9 +225,15 @@ wss.on("connection", (ws) => {
       }
       users.set(info.username, ws);
 
-      console.log(`👥 ${info.username} joined ${info.roomId}`);
+      console.log("Joined: " + info.username + " -> " + info.roomId + " (peers: " + existing.length + ")");
 
-      send(ws, "joined", { roomId: info.roomId, username: info.username });
+      // peers = kto uz v miestnosti je. Novoprichadzajuci im posle offer,
+      // oni cakaju - tym sa vyhneme sucasnym offerom z oboch stran (glare).
+      send(ws, "joined", {
+        roomId: info.roomId,
+        username: info.username,
+        peers: existing.map(p => meta.get(p).username)
+      });
 
       broadcastToRoom(info.roomId, ws, "peer-joined", {
         peerId: info.username,
@@ -304,7 +344,29 @@ wss.on("connection", (ws) => {
     }
 
     if (["offer", "answer", "candidate"].includes(type)) {
-      broadcastToRoom(roomId, ws, type, { from: username, ...data });
+      // Mesh: kazda dvojica ma vlastne spojenie, preto signal patri konkretnemu
+      // ucastnikovi. Bez "to" (starsi klient, 1:1) sa posle celej miestnosti.
+      if (data.to) {
+        const target = [...(rooms.get(roomId) || [])]
+          .find(p => meta.get(p)?.username === data.to);
+        if (target) {
+          send(target, type, { from: username, ...data });
+        } else {
+          console.log("Signal " + type + " for " + data.to + " - not in room " + roomId);
+        }
+      } else {
+        broadcastToRoom(roomId, ws, type, { from: username, ...data });
+      }
+      return;
+    }
+
+    // Prizvany uz niekde telefonuje - odpoved ide priamo prizyvajucemu,
+    // ten NIE JE v miestnosti hovoru prijemcu, preto routujeme globalne.
+    if (type === "busy") {
+      const target = users.get(data.to);
+      if (target) {
+        send(target, "peer-busy", { from: username, callId: data.callId });
+      }
       return;
     }
 
@@ -384,8 +446,7 @@ wss.on("connection", (ws) => {
     }
 
     if (type === "leave") {
-      broadcastToRoom(roomId, ws, "peer-left", { peerId: username });
-      rooms.get(roomId)?.delete(ws);
+      handlePeerLeave(ws, roomId, username);
       // Zmaž mapping len ak patrí TOMUTO socketu (inak by leave starého socketu
       // zmazal mapping nového po re-joine)
       if (users.get(username) === ws) users.delete(username);
@@ -404,8 +465,7 @@ wss.on("connection", (ws) => {
   ws.on("close", () => {
     const info = meta.get(ws);
     if (info?.roomId) {
-      broadcastToRoom(info.roomId, ws, "peer-left", { peerId: info.username });
-      rooms.get(info.roomId)?.delete(ws);
+      handlePeerLeave(ws, info.roomId, info.username);
       const pending = pendingCalls.get(info.roomId);
       if (pending && pending.fromUsername === info.username) {
         pendingCalls.delete(info.roomId);
