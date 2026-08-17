@@ -221,6 +221,13 @@ wss.on("connection", (ws) => {
 
       const old = users.get(info.username);
       if (old && old !== ws) {
+        // Re-join toho isteho usera: stary socket odstran z miestnosti TICHO
+        // (bez peer-left/call-ended) - user nikam neodisiel, len ma novy socket.
+        const oldInfo = meta.get(old);
+        if (oldInfo) {
+          oldInfo.superseded = true;
+          if (oldInfo.roomId) rooms.get(oldInfo.roomId)?.delete(old);
+        }
         try { old.terminate(); } catch {}
       }
       users.set(info.username, ws);
@@ -471,6 +478,10 @@ wss.on("connection", (ws) => {
 
   ws.on("close", () => {
     const info = meta.get(ws);
+    if (info?.superseded) {
+      meta.delete(ws);
+      return;
+    }
     if (info?.roomId) {
       handlePeerLeave(ws, info.roomId, info.username);
       const pending = pendingCalls.get(info.roomId);
