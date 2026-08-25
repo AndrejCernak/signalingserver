@@ -101,9 +101,21 @@ function handlePeerLeave(ws, roomId, username) {
   if (!roomId) return;
   broadcastToRoom(roomId, ws, "peer-left", { peerId: username });
   rooms.get(roomId)?.delete(ws);
-  if (roomPeerCount(roomId) === 1) {
+
+  const pending = pendingCalls.get(roomId);
+  if (pending && pending.fromUsername === username) {
+    // Volajuci zrusil hovor skor, nez ho niekto prijal (pendingCalls sa maze
+    // pri prvom accepte). Bez tohto by ostatnym telefonom zvonilo dalej,
+    // pretoze v miestnosti ich ostalo viac ako jeden.
+    pendingCalls.delete(roomId);
+    pendingAccepts.delete(roomId);
+    console.log("Caller " + username + " cancelled room " + roomId + " - ending for all");
+    broadcastToRoom(roomId, ws, "call-ended", { from: username });
+  } else if (roomPeerCount(roomId) === 1) {
+    // Ostal posledny clovek -> hovor realne skoncil.
     broadcastToRoom(roomId, ws, "call-ended", { from: username });
   }
+
   if (roomPeerCount(roomId) === 0) rooms.delete(roomId);
 }
 
