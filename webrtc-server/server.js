@@ -46,12 +46,24 @@ function broadcastToRoom(roomId, except, type, payload = {}) {
   }
 }
 
-function sendPushNotification(toUser, fromUser, fromName, content, kind, urlIndex = 0) {
+/**
+ * Komu spravu dorucit. Skupinovy chat posiela zoznam clenov v `members`,
+ * 1:1 chat jedineho prijemcu v `to`. Seba sameho vzdy vynechame.
+ */
+function chatRecipients(data, sender) {
+  if (Array.isArray(data.members) && data.members.length) {
+    return [...new Set(data.members)].filter(m => m && m !== sender);
+  }
+  return data.to ? [data.to] : [];
+}
+
+function sendPushNotification(toUser, fromUser, fromName, content, kind, urlIndex = 0, group = null) {
   if (urlIndex >= FRAPPE_NOTIFY_URLS.length) return;
   const data = JSON.stringify({
     "to_user": toUser,
     "from_user": fromUser,
     "from_name": fromName || "Niekto",
+    ...(group ? { "group_id": group.id, "group_name": group.name } : {}),
     "content": kind === 'file' ? "📎 Poslal vám súbor" : content
   });
 
@@ -75,7 +87,7 @@ function sendPushNotification(toUser, fromUser, fromName, content, kind, urlInde
         console.log(`OK Frappe notify Success (${res.statusCode}) via ${url.hostname}`);
       } else if (userNotFound) {
         console.log(`.. ${url.hostname}: user ${toUser} not found, trying next backend`);
-        sendPushNotification(toUser, fromUser, fromName, content, kind, urlIndex + 1);
+        sendPushNotification(toUser, fromUser, fromName, content, kind, urlIndex + 1, group);
       } else {
         console.error(`ERR Frappe notify Error (${res.statusCode}) via ${url.hostname}:`, responseBody);
       }
@@ -397,68 +409,54 @@ wss.on("connection", (ws) => {
     }
 
     if (type === "chat-message") {
-      const { to, content, kind, filename, messageId } = data;
-      const msg = {
-        messageId, from: username, to, content, kind, filename,
-        timestamp: new Date().toISOString()
-      };
+      const { content, kind, filename, messageId, groupId, groupName } = data;
+      const targets = chatRecipients(data, username);
+      const group = groupId ? { id: groupId, name: groupName || "Skupina" } : null;
 
-      const recipient = users.get(to);
-
-      // Doruč cez socket ak je príjemca pripojený (živý chat vo popredí).
-      if (recipient && recipient.readyState === recipient.OPEN) {
-        try {
-          recipient.send(JSON.stringify({ type: "chat-message", ...msg }));
-        } catch (e) {}
-      }
-
-      // Push posielame VŽDY. iOS appka si banner potlačí sama, ak má práve
-      // ten chat otvorený (willPresent). Dôvod: suspendovaná appka drží socket
-      // "OPEN" ešte ~30s (heartbeat interval), takže by inak vyzerala online
-      // a push by neprišiel → chýbajúce notifikácie. Vždy-push to spoľahlivo rieši.
-      sendPushNotification(to, username, info.username, content, kind);
-
-      if (!pendingMessages.has(to)) pendingMessages.set(to, new Map());
-      const queue = pendingMessages.get(to);
-      queue.set(messageId, msg);
-      // Strop: ak fronta prerastie limit, zahoď najstaršiu správu (Map drží poradie vloženia)
-      while (queue.size > MAX_QUEUED_PER_USER) {
-        queue.delete(queue.keys().next().value);
-      }
-      return;
-    }
-
-    if (type === "chat-edit") {
-      const { to, messageId, content } = data;
-      const recipient = users.get(to);
-      if (recipient && recipient.readyState === recipient.OPEN) {
-        recipient.send(JSON.stringify({
-          type: "chat-edit", from: username, to, messageId, content
-        }));
-      }
-      return;
-    }
-
-    if (type === "chat-delete") {
-      const { to, messageId } = data;
-      const recipient = users.get(to);
-      if (recipient && recipient.readyState === recipient.OPEN) {
-        recipient.send(JSON.stringify({
-          type: "chat-delete", from: username, to, messageId
-        }));
-      }
-      return;
-    }
-
-    if (type === "chat-reaction") {
-      const { to, messageId, emoji } = data;
-      const recipient = users.get(to);
-      if (recipient && recipient.readyState === recipient.OPEN) {
-        const payload = {
-          type: "chat-reaction", from: username, to, messageId
+      for (const to of targets) {
+        const msg = {
+          messageId, from: username, to, content, kind, filename,
+          timestamp: new Date().toISOString(),
+          ...(group ? { groupId: group.id, groupName: group.name, members: data.members } : {})
         };
-        if (emoji) payload.emoji = emoji;
-        recipient.send(JSON.stringify(payload));
+
+        // Doruc cez socket ak je prijemca pripojeny (zivy chat vo popredi).
+        const recipient = users.get(to);
+        if (recipient && recipient.readyState === recipient.OPEN) {
+          try {
+            recipient.send(JSON.stringify({ type: "chat-message", ...msg }));
+          } catch (e) {}
+        }
+
+        // Push posielame VZDY. iOS appka si banner potlaci sama, ak ma prave
+        // ten chat otvoreny (willPresent). Suspendovana appka drzi socket "OPEN"
+        // este ~30s, takze by inak vyzerala online a push by neprisiel.
+        sendPushNotification(to, username, info.username, content, kind, 0, group);
+
+        if (!pendingMessages.has(to)) pendingMessages.set(to, new Map());
+        const queue = pendingMessages.get(to);
+        queue.set(messageId, msg);
+        // Strop: ak fronta prerastie limit, zahod najstarsiu spravu
+        while (queue.size > MAX_QUEUED_PER_USER) {
+          queue.delete(queue.keys().next().value);
+        }
+      }
+      return;
+    }
+
+    // Uprava / zmazanie / reakcia — rovnake routovanie ako pri sprave:
+    // skupine sa posle vsetkym clenom, 1:1 jedinemu prijemcovi.
+    if (type === "chat-edit" || type === "chat-delete" || type === "chat-reaction") {
+      const { messageId, content, emoji, groupId } = data;
+      for (const to of chatRecipients(data, username)) {
+        const recipient = users.get(to);
+        if (recipient && recipient.readyState === recipient.OPEN) {
+          const payload = { type, from: username, to, messageId };
+          if (type === "chat-edit") payload.content = content;
+          if (type === "chat-reaction") payload.emoji = emoji;
+          if (groupId) payload.groupId = groupId;
+          try { recipient.send(JSON.stringify(payload)); } catch (e) {}
+        }
       }
       return;
     }
