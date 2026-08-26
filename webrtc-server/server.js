@@ -444,6 +444,22 @@ wss.on("connection", (ws) => {
       return;
     }
 
+    // Zmena skupiny (premenovanie, pridanie clena, odchod) — oznam ostatnym,
+    // aby si appka stiahla aktualny stav a nemusela sa restartovat.
+    if (type === "group-changed") {
+      for (const to of chatRecipients(data, username)) {
+        const recipient = users.get(to);
+        if (recipient && recipient.readyState === recipient.OPEN) {
+          try {
+            recipient.send(JSON.stringify({
+              type: "group-changed", from: username, groupId: data.groupId
+            }));
+          } catch (e) {}
+        }
+      }
+      return;
+    }
+
     // Uprava / zmazanie / reakcia — rovnake routovanie ako pri sprave:
     // skupine sa posle vsetkym clenom, 1:1 jedinemu prijemcovi.
     if (type === "chat-edit" || type === "chat-delete" || type === "chat-reaction") {
